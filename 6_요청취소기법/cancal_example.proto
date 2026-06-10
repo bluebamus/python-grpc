@@ -1,0 +1,17 @@
+syntax="proto3";
+
+package cancel_example;
+
+service CancelService {
+    rpc LongRunningOperation(Request)returns(Response);
+}
+
+message Request{
+    string request_data=1;
+}
+
+message Response{
+    string response_data=1;
+}
+
+//python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. cancal_example.proto

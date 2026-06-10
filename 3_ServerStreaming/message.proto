@@ -1,0 +1,16 @@
+syntax = "proto3";                                  // protobuf 문법 버전 선언 (proto3)
+
+package example;                                     // 패키지(네임스페이스) 이름, 메시지/서비스 이름 충돌 방지
+
+service ChatService {                               // ChatService 라는 gRPC 서비스 정의
+    rpc ChatStream(ChatMessage) returns (stream ChatMessage) {}  // Server Streaming RPC: 요청 1개 → 응답 여러 개(stream)
+}
+
+message ChatMessage{                               // 채팅 메시지 타입 정의
+    string message = 1;                             // message 필드 (문자열), 태그 번호 1
+}
+
+// python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. message.proto
+//
+// [생성 파일] message_pb2.py (메시지 클래스), message_pb2_grpc.py (서비스 stub/servicer)
+// [-I=.] import 경로(현재 폴더) / [--python_out] 메시지 코드 출력 / [--grpc_python_out] 서비스 코드 출력
