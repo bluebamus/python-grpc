@@ -1,0 +1,12 @@
+# 1. 다운로드 (64-bit Windows)
+curl -L -o grpcurl.zip https://github.com/fullstorydev/grpcurl/releases/download/v1.8.7/grpcurl_1.8.7_windows_x86_64.zip
+
+# 2. 압축 해제
+unzip grpcurl.zip
+
+# 3. 현재 프로젝트 폴더에 grpcurl.exe 존재
+# 프로젝트 내에서만 사용: ./grpcurl.exe -version
+
+#example sample
+./grpcurl.exe -plaintext localhost:50051 list
+
