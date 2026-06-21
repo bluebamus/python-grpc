@@ -34,6 +34,19 @@ wheels = [
 ]
 
 [[package]]
+name = "grpcio-reflection"
+version = "1.80.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c3/eb/b84590a0794ae2509cdc9896f66ae2949ac8d85a2078fe4412bb6ca1211f/grpcio_reflection-1.80.0.tar.gz", hash = "sha256:e9c76aabc4324279945b70bc76a3d41bc4f9396bffcf1cfc1011a571c2c56221", size = 19211, upload-time = "2026-03-30T08:54:36.73Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/29/49fbd2593a29dab9cd5837f67668157ef7a24c16eac232852379e8e43266/grpcio_reflection-1.80.0-py3-none-any.whl", hash = "sha256:a7d0b77961b1c722400b1509968f1ad3a64e9d78280d4cf5b88b6cfe5b41eb61", size = 22917, upload-time = "2026-03-30T08:54:00.008Z" },
+]
+
+[[package]]
 name = "grpcio-tools"
 version = "1.80.0"
 source = { registry = "https://pypi.org/simple" }
@@ -87,12 +100,14 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "grpcio" },
+    { name = "grpcio-reflection" },
     { name = "grpcio-tools" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "grpcio", specifier = ">=1.80.0" },
+    { name = "grpcio-reflection", specifier = ">=1.80.0" },
     { name = "grpcio-tools", specifier = ">=1.80.0" },
 ]
 
