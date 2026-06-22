@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FastAPI / Django에서 grpcurl(리플렉션) 사용하기 — 설계 가이드</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --note-bg: #ddf4ff;
+    --note-border: #54aeff;
+    --warn-bg: #fff8c5;
+    --warn-border: #d4a72c;
+    --good-bg: #dafbe1;
+    --good-border: #4ac26b;
+    --bad-bg: #ffebe9;
+    --bad-border: #ff8182;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.7;
+    font-size: 16px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 40px 24px 120px; }
+  h1 { font-size: 2em; border-bottom: 2px solid var(--border); padding-bottom: .3em; line-height: 1.3; }
+  h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: .3em; margin-top: 2.2em; }
+  h3 { font-size: 1.2em; margin-top: 1.8em; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  p, li { color: var(--fg); }
+  code {
+    background: var(--code-bg);
+    padding: .2em .4em;
+    border-radius: 6px;
+    font-family: "SFMono-Regular", "Cascadia Code", Consolas, "Liberation Mono", monospace;
+    font-size: .88em;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: .85em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .94em; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  tr:nth-child(even) td { background: #fbfcfd; }
+  blockquote {
+    margin: 1em 0; padding: .6em 1em; border-radius: 6px;
+    border-left: 4px solid var(--note-border); background: var(--note-bg);
+  }
+  blockquote.warn { border-left-color: var(--warn-border); background: var(--warn-bg); }
+  blockquote.good { border-left-color: var(--good-border); background: var(--good-bg); }
+  blockquote.bad  { border-left-color: var(--bad-border);  background: var(--bad-bg); }
+  blockquote p { margin: .3em 0; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+  .toc { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 24px; }
+  .toc ol { margin: .4em 0; }
+  .lead { color: var(--muted); font-size: 1.05em; }
+  .tag { display: inline-block; font-size: .8em; padding: 1px 8px; border-radius: 999px; background: var(--code-bg); border: 1px solid var(--border); color: var(--muted); }
+  .ok  { color: #1a7f37; font-weight: 600; }
+  .no  { color: #cf222e; font-weight: 600; }
+  h2 a.anchor { font-size: .7em; color: var(--muted); margin-left: .4em; opacity: 0; }
+  h2:hover a.anchor { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>FastAPI / Django에서 grpcurl(리플렉션) 사용하기 — 설계 가이드</h1>
+
+<p class="lead"><code>grpcurl</code>은 <strong>gRPC 서버 리플렉션</strong>을 이용해 <code>.proto</code> 파일 없이도 서버를 탐색·호출하는 <strong>CLI 디버깅 도구</strong>입니다. (이 폴더 <code>12_서버의정보받아오기-리플렉션</code>의 <code>HOWTO.md</code> 참고)</p>
+
+<p>학습 예제에서는 터미널에서 <code>grpcurl.exe ... list</code> 같은 명령을 직접 입력했습니다. 하지만 <strong>FastAPI·Django 같은 웹 서버 안에서 터미널 명령(grpcurl)을 실행하는 것은 좋은 설계가 아닙니다.</strong> 이 문서는 그 이유와, 같은 일을 <strong>코드로 올바르게 구현하는 방법</strong>을 단계별로 설명합니다.</p>
+
+<blockquote><p>📌 <strong>한 줄 요약:</strong> <code>grpcurl</code>이 하는 일(리플렉션으로 서비스 조회 + 동적 호출)은 전부 <strong>파이썬 gRPC 라이브러리로 직접</strong> 할 수 있습니다. 웹 앱에서는 외부 CLI를 호출하지 말고 <strong>리플렉션 API</strong>를 쓰세요.</p></blockquote>
+
+<hr>
+
+<div class="toc">
+<strong>목차</strong>
+<ol>
+  <li><a href="#s1">왜 웹 서버에서 grpcurl을 직접 호출하면 안 되는가</a></li>
+  <li><a href="#s2">핵심 개념: grpcurl = 리플렉션 + 동적 호출</a></li>
+  <li><a href="#s3">세 가지 접근 방식 비교</a></li>
+  <li><a href="#s4">공통 모듈: 리플렉션 기반 동적 gRPC 클라이언트</a></li>
+  <li><a href="#s5">FastAPI 적용</a></li>
+  <li><a href="#s6">Django 적용</a></li>
+  <li><a href="#s7">추천: 운영 환경에서는 stub을 미리 생성</a></li>
+  <li><a href="#s8">안티패턴: subprocess로 grpcurl 실행 (피하세요)</a></li>
+  <li><a href="#s9">자주 발생하는 오류</a></li>
+</ol>
+</div>
+
+<hr>
+
+<h2 id="s1">1. 왜 웹 서버에서 grpcurl을 직접 호출하면 안 되는가</h2>
+
+<p>터미널에서 <code>grpcurl</code>을 치는 것과, FastAPI/Django <strong>요청 처리 중에</strong> <code>grpcurl</code>을 실행(<code>subprocess</code>)하는 것은 전혀 다릅니다. 후자는 다음 문제가 있습니다.</p>
+
+<table>
+  <thead><tr><th>문제</th><th>설명</th></tr></thead>
+  <tbody>
+    <tr><td><strong>성능</strong></td><td>요청마다 새 <strong>프로세스를 fork</strong> → CPU·메모리 낭비, 지연 증가. gRPC의 장점인 커넥션 재사용이 사라집니다.</td></tr>
+    <tr><td><strong>취약한 파싱</strong></td><td>grpcurl의 <strong>표준출력(텍스트/JSON)을 문자열로 파싱</strong>해야 함. 출력 형식이 바뀌면 깨집니다.</td></tr>
+    <tr><td><strong>에러 처리 불가</strong></td><td>gRPC 상태 코드(<code>UNAVAILABLE</code>, <code>NOT_FOUND</code> 등)를 구조적으로 다루기 어렵고, exit code·stderr 텍스트에 의존하게 됩니다.</td></tr>
+    <tr><td><strong>보안(명령어 주입)</strong></td><td>사용자 입력을 grpcurl 인자로 넘기면 <strong>셸 인젝션</strong> 위험.</td></tr>
+    <tr><td><strong>배포 복잡도</strong></td><td>컨테이너/서버마다 <code>grpcurl</code> 바이너리를 별도 설치·관리해야 합니다.</td></tr>
+    <tr><td><strong>관측성 부족</strong></td><td>메트릭·트레이싱·타임아웃·재시도 같은 gRPC 클라이언트 기능을 못 씁니다.</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good"><p>✅ <strong>결론:</strong> grpcurl은 <strong>사람이 손으로 디버깅할 때 쓰는 도구</strong>입니다. 애플리케이션 코드 안에서는 <strong>gRPC 라이브러리 API</strong>를 직접 사용하세요.</p></blockquote>
+
+<hr>
+
+<h2 id="s2">2. 핵심 개념: grpcurl = 리플렉션 + 동적 호출</h2>
+
+<p><code>grpcurl localhost:50051 list</code> 명령이 내부에서 하는 일은 사실 단순합니다.</p>
+<ol>
+  <li>서버의 <strong>리플렉션 서비스</strong>(<code>grpc.reflection.v1alpha.ServerReflection</code>)에 접속한다.</li>
+  <li>"어떤 서비스/메서드/메시지가 있냐"고 물어 <strong>proto 정의(디스크립터)</strong>를 받아온다.</li>
+  <li>받은 디스크립터로 <strong>요청 메시지를 동적으로 만들어</strong> 서버 메서드를 호출한다.</li>
+</ol>
+
+<p>이 3단계는 모두 파이썬으로 그대로 구현할 수 있습니다.</p>
+<ul>
+  <li>1·2단계 → <code>grpc_reflection</code> 패키지 (<code>reflection_client.py</code>에서 이미 맛봤습니다)</li>
+  <li>3단계 → <code>google.protobuf</code>의 <strong>DescriptorPool + 메시지 팩토리 + 제네릭 채널 호출</strong></li>
+</ul>
+
+<p>즉, <strong>별도 proto 파일이 없어도</strong> grpcurl처럼 "조회하고 호출"할 수 있습니다.</p>
+
+<hr>
+
+<h2 id="s3">3. 세 가지 접근 방식 비교</h2>
+
+<table>
+  <thead><tr><th>방식</th><th>언제 쓰나</th><th>장점</th><th>단점</th></tr></thead>
+  <tbody>
+    <tr><td><strong>A. 미리 생성한 stub 사용</strong> (7장)</td><td>호출할 서비스의 <code>.proto</code>를 안다 (대부분의 운영)</td><td>타입 안전, 가장 빠름, 단순</td><td>빌드 시 proto 코드 생성 필요</td></tr>
+    <tr><td><strong>B. 리플렉션 동적 클라이언트</strong> (4~6장)</td><td>proto 없이 임의 서버를 탐색/호출 (어드민·게이트웨이·디버그 UI)</td><td>proto 불필요, grpcurl과 동일한 유연성</td><td>코드 복잡, 런타임 의존, 타입 안전 약함</td></tr>
+    <tr><td><strong>C. subprocess로 grpcurl 실행</strong> (8장)</td><td class="no">❌ 권장하지 않음</td><td>빠른 임시 방편</td><td>위 1장의 모든 문제</td></tr>
+  </tbody>
+</table>
+
+<blockquote><p>💡 운영 서비스의 일반 호출은 <strong>A</strong>, "grpcurl을 웹으로 옮기고 싶다"(관리자 콘솔/동적 게이트웨이)면 <strong>B</strong>를 쓰세요. <strong>C는 피하세요.</strong></p></blockquote>
+
+<hr>
+
+<h2 id="s4">4. 공통 모듈: 리플렉션 기반 동적 gRPC 클라이언트</h2>
+
+<p>먼저 FastAPI·Django가 공유할 <strong>순수 파이썬 동적 클라이언트</strong>를 만듭니다. 이게 grpcurl의 핵심 기능(<code>list</code>, <code>describe</code>, 메서드 호출)을 코드로 옮긴 것입니다.</p>
+
+<blockquote><p>필요 패키지: <code>grpcio</code>, <code>grpcio-reflection</code>, <code>protobuf</code> (이 프로젝트는 <code>uv sync</code>로 설치됨)</p></blockquote>
+
+<p><code>grpc_reflection_client.py</code>:</p>
+
+<pre><code>"""리플렉션으로 gRPC 서버를 탐색/호출하는 동적 클라이언트.
+
+grpcurl의 list / describe / 메서드 호출을 순수 파이썬으로 구현한다.
+proto 파일이 없어도 서버 리플렉션만 켜져 있으면 동작한다.
+"""
+import grpc
+from google.protobuf.descriptor_pool import DescriptorPool
+from google.protobuf.json_format import MessageToDict, ParseDict
+from grpc_reflection.v1alpha.proto_reflection_descriptor_database import (
+    ProtoReflectionDescriptorDatabase,
+)
+
+try:
+    # protobuf >= 4.22 권장 API
+    from google.protobuf.message_factory import GetMessageClass
+
+    def _message_class(descriptor):
+        return GetMessageClass(descriptor)
+except ImportError:  # 구버전 protobuf 호환
+    from google.protobuf.message_factory import MessageFactory
+
+    _factory = MessageFactory()
+
+    def _message_class(descriptor):
+        return _factory.GetPrototype(descriptor)
+
+
+class GrpcReflectionClient:
+    """하나의 gRPC 서버 주소에 대한 동적 클라이언트."""
+
+    def __init__(self, target: str):
+        # 학습용이라 평문(insecure). 운영에서는 grpc.secure_channel + TLS 사용.
+        self._channel = grpc.insecure_channel(target)
+        self._db = ProtoReflectionDescriptorDatabase(self._channel)
+        self._pool = DescriptorPool(self._db)
+
+    def close(self):
+        self._channel.close()
+
+    # with 문 지원 (자원 자동 정리)
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # ── grpcurl list ─────────────────────────────────────────────
+    def list_services(self) -> list[str]:
+        """서버가 노출하는 서비스 전체 이름 목록. (grpcurl ... list)"""
+        return list(self._db.get_services())
+
+    def list_methods(self, service_name: str) -> list[str]:
+        """특정 서비스의 메서드 이름 목록. (grpcurl ... list &lt;svc&gt;)"""
+        service = self._pool.FindServiceByName(service_name)
+        return [m.name for m in service.methods]
+
+    # ── grpcurl describe ─────────────────────────────────────────
+    def describe_method(self, service_name: str, method_name: str) -> dict:
+        """메서드의 입력/출력 메시지 타입을 설명. (grpcurl ... describe)"""
+        service = self._pool.FindServiceByName(service_name)
+        method = service.FindMethodByName(method_name)
+        return {
+            "name": method.full_name,
+            "input_type": method.input_type.full_name,
+            "output_type": method.output_type.full_name,
+            "client_streaming": method.client_streaming,
+            "server_streaming": method.server_streaming,
+        }
+
+    # ── grpcurl -d '{...}' &lt;svc&gt;/&lt;method&gt; (unary 호출) ───────────
+    def call_unary(self, service_name: str, method_name: str, payload: dict) -> dict:
+        """JSON 페이로드로 unary 메서드를 호출하고 응답을 dict로 반환.
+
+        grpcurl -d '{"message":"hi"}' host svc/Method 와 동일한 동작.
+        """
+        service = self._pool.FindServiceByName(service_name)
+        method = service.FindMethodByName(method_name)
+        if method.client_streaming or method.server_streaming:
+            raise ValueError("이 헬퍼는 unary-unary 메서드만 지원합니다.")
+
+        request_cls = _message_class(method.input_type)
+        response_cls = _message_class(method.output_type)
+
+        # dict(JSON) → protobuf 메시지
+        request_msg = ParseDict(payload, request_cls())
+
+        # 제네릭 채널 호출 (stub 없이 메서드 경로를 직접 지정)
+        rpc = self._channel.unary_unary(
+            f"/{service_name}/{method_name}",
+            request_serializer=request_cls.SerializeToString,
+            response_deserializer=response_cls.FromString,
+        )
+        response_msg = rpc(request_msg)
+
+        # protobuf 메시지 → dict(JSON)
+        return MessageToDict(response_msg, preserving_proto_field_name=True)
+</code></pre>
+
+<h3>이 모듈이 grpcurl 명령에 대응되는 표</h3>
+
+<table>
+  <thead><tr><th>grpcurl 명령</th><th>이 모듈 메서드</th></tr></thead>
+  <tbody>
+    <tr><td><code>grpcurl -plaintext localhost:50051 list</code></td><td><code>list_services()</code></td></tr>
+    <tr><td><code>grpcurl -plaintext localhost:50051 list reflection_example.EchoService</code></td><td><code>list_methods("reflection_example.EchoService")</code></td></tr>
+    <tr><td><code>grpcurl ... describe reflection_example.EchoService.Echo</code></td><td><code>describe_method("reflection_example.EchoService", "Echo")</code></td></tr>
+    <tr><td><code>grpcurl -d '{"message":"hi"}' ... reflection_example.EchoService/Echo</code></td><td><code>call_unary("reflection_example.EchoService", "Echo", {"message": "hi"})</code></td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<h2 id="s5">5. FastAPI 적용</h2>
+
+<p>FastAPI에서는 위 동적 클라이언트를 <strong>REST 엔드포인트로 감싸서</strong> "웹에서 쓰는 grpcurl"을 만들 수 있습니다.</p>
+
+<blockquote class="warn"><p>⚠️ <code>ProtoReflectionDescriptorDatabase</code>는 <strong>동기(blocking)</strong> 호출입니다. FastAPI의 비동기 이벤트 루프를 막지 않도록, gRPC 작업은 <code>run_in_threadpool</code>로 스레드에서 실행합니다.</p></blockquote>
+
+<p><code>main.py</code>:</p>
+
+<pre><code>import grpc
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel
+
+from grpc_reflection_client import GrpcReflectionClient
+
+GRPC_TARGET = "localhost:50051"  # 호출 대상 gRPC 서버
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 앱 시작 시 채널 1개를 만들어 재사용 (요청마다 새로 만들지 않음)
+    app.state.grpc = GrpcReflectionClient(GRPC_TARGET)
+    yield
+    app.state.grpc.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+class CallRequest(BaseModel):
+    payload: dict
+
+
+# grpcurl list  →  GET /grpc/services
+@app.get("/grpc/services")
+async def list_services():
+    client: GrpcReflectionClient = app.state.grpc
+    services = await run_in_threadpool(client.list_services)
+    return {"services": services}
+
+
+# grpcurl list &lt;svc&gt;  →  GET /grpc/services/{service}/methods
+@app.get("/grpc/services/{service}/methods")
+async def list_methods(service: str):
+    client: GrpcReflectionClient = app.state.grpc
+    try:
+        methods = await run_in_threadpool(client.list_methods, service)
+    except KeyError:
+        raise HTTPException(404, f"service not found: {service}")
+    return {"service": service, "methods": methods}
+
+
+# grpcurl -d '{...}' &lt;svc&gt;/&lt;method&gt;  →  POST /grpc/{service}/{method}
+@app.post("/grpc/{service}/{method}")
+async def call_method(service: str, method: str, body: CallRequest):
+    client: GrpcReflectionClient = app.state.grpc
+    try:
+        result = await run_in_threadpool(
+            client.call_unary, service, method, body.payload
+        )
+    except grpc.RpcError as e:
+        raise HTTPException(502, f"gRPC error: {e.code().name}: {e.details()}")
+    return {"response": result}
+</code></pre>
+
+<p><strong>사용 예 (터미널 명령 대신 HTTP 요청):</strong></p>
+
+<pre><code># 학습 예제에서: grpcurl -plaintext localhost:50051 list
+curl http://localhost:8000/grpc/services
+
+# grpcurl -plaintext localhost:50051 list reflection_example.EchoService
+curl http://localhost:8000/grpc/services/reflection_example.EchoService/methods
+
+# grpcurl -d '{"message":"hello"}' ... reflection_example.EchoService/Echo
+curl -X POST http://localhost:8000/grpc/reflection_example.EchoService/Echo \
+     -H "Content-Type: application/json" \
+     -d '{"payload": {"message": "hello"}}'
+</code></pre>
+
+<p>이제 grpcurl을 터미널에서 칠 필요 없이, <strong>FastAPI가 리플렉션을 대신 수행</strong>합니다.</p>
+
+<hr>
+
+<h2 id="s6">6. Django 적용</h2>
+
+<p>Django에서는 두 가지 위치에서 쓸 수 있습니다.</p>
+
+<h3>6-1. 뷰(View)에서 — 웹 API로 노출</h3>
+
+<p><code>grpc_proxy/views.py</code>:</p>
+
+<pre><code>import json
+
+import grpc
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+from grpc_reflection_client import GrpcReflectionClient
+
+GRPC_TARGET = "localhost:50051"
+
+
+# grpcurl list
+@require_http_methods(["GET"])
+def list_services(request):
+    with GrpcReflectionClient(GRPC_TARGET) as client:
+        return JsonResponse({"services": client.list_services()})
+
+
+# grpcurl list &lt;svc&gt;
+@require_http_methods(["GET"])
+def list_methods(request, service):
+    with GrpcReflectionClient(GRPC_TARGET) as client:
+        try:
+            methods = client.list_methods(service)
+        except KeyError:
+            return JsonResponse({"error": f"service not found: {service}"}, status=404)
+    return JsonResponse({"service": service, "methods": methods})
+
+
+# grpcurl -d '{...}' &lt;svc&gt;/&lt;method&gt;
+@csrf_exempt  # 실제 서비스에서는 적절한 인증/CSRF 정책을 적용하세요.
+@require_http_methods(["POST"])
+def call_method(request, service, method):
+    payload = json.loads(request.body or "{}").get("payload", {})
+    with GrpcReflectionClient(GRPC_TARGET) as client:
+        try:
+            result = client.call_unary(service, method, payload)
+        except grpc.RpcError as e:
+            return JsonResponse(
+                {"error": f"{e.code().name}: {e.details()}"}, status=502
+            )
+    return JsonResponse({"response": result})
+</code></pre>
+
+<p><code>grpc_proxy/urls.py</code>:</p>
+
+<pre><code>from django.urls import path
+
+from . import views
+
+urlpatterns = [
+    path("grpc/services", views.list_services),
+    path("grpc/services/&lt;str:service&gt;/methods", views.list_methods),
+    path("grpc/&lt;str:service&gt;/&lt;str:method&gt;", views.call_method),
+]
+</code></pre>
+
+<blockquote><p>💡 위 뷰는 요청마다 채널을 새로 엽니다(간단함 우선). 트래픽이 많으면 <strong>채널을 모듈 전역으로 1개 만들어 재사용</strong>하거나, 앱 <code>ready()</code>에서 초기화해 캐싱하세요.</p></blockquote>
+
+<h3>6-2. management 명령에서 — "코드로 된 grpcurl"</h3>
+
+<p>운영/CI 스크립트에서 터미널 grpcurl 대신 Django 명령으로 조회할 수 있습니다.</p>
+
+<p><code>grpc_proxy/management/commands/grpc_list.py</code>:</p>
+
+<pre><code>from django.core.management.base import BaseCommand
+
+from grpc_reflection_client import GrpcReflectionClient
+
+
+class Command(BaseCommand):
+    help = "리플렉션으로 gRPC 서버의 서비스 목록을 출력 (grpcurl list 대체)"
+
+    def add_arguments(self, parser):
+        parser.add_argument("--target", default="localhost:50051")
+
+    def handle(self, *args, **opts):
+        with GrpcReflectionClient(opts["target"]) as client:
+            for name in client.list_services():
+                self.stdout.write(name)
+</code></pre>
+
+<p>실행: <code>python manage.py grpc_list --target localhost:50051</code><br>
+→ 외부 grpcurl 바이너리 없이, <strong>프로젝트 코드 안에서</strong> 동일 결과를 얻습니다.</p>
+
+<hr>
+
+<h2 id="s7">7. 추천: 운영 환경에서는 stub을 미리 생성</h2>
+
+<p>호출할 서비스의 <code>.proto</code>를 <strong>알고 있다면</strong>(대부분의 운영 상황), 리플렉션조차 필요 없습니다. 이 폴더의 <code>reflection_example.proto</code>처럼 <strong>빌드 시점에 stub을 생성</strong>해 직접 호출하는 것이 가장 안전하고 빠릅니다.</p>
+
+<pre><code># 한 번만: proto → 파이썬 코드 생성
+uv run python -m grpc_tools.protoc -I=. \
+    --python_out=. --grpc_python_out=. reflection_example.proto
+</code></pre>
+
+<p><strong>FastAPI(async)에서 생성 stub 호출:</strong></p>
+
+<pre><code>import grpc
+import reflection_example_pb2 as pb2
+import reflection_example_pb2_grpc as pb2_grpc
+
+@app.post("/echo")
+async def echo(text: str):
+    async with grpc.aio.insecure_channel("localhost:50051") as channel:
+        stub = pb2_grpc.EchoServiceStub(channel)
+        resp = await stub.Echo(pb2.EchoRequest(message=text))
+        return {"message": resp.message}
+</code></pre>
+
+<p><strong>Django에서 생성 stub 호출:</strong></p>
+
+<pre><code>import grpc
+import reflection_example_pb2 as pb2
+import reflection_example_pb2_grpc as pb2_grpc
+
+def echo_view(request):
+    with grpc.insecure_channel("localhost:50051") as channel:
+        stub = pb2_grpc.EchoServiceStub(channel)
+        resp = stub.Echo(pb2.EchoRequest(message=request.GET["text"]))
+    return JsonResponse({"message": resp.message})
+</code></pre>
+
+<table>
+  <thead><tr><th>항목</th><th>동적 리플렉션(4~6장)</th><th>미리 생성한 stub(7장)</th></tr></thead>
+  <tbody>
+    <tr><td>proto 필요</td><td class="no">❌ 런타임에 받아옴</td><td class="ok">✅ 빌드 시 생성</td></tr>
+    <tr><td>타입 안전</td><td>약함</td><td>강함</td></tr>
+    <tr><td>속도</td><td>디스크립터 조회 오버헤드</td><td>가장 빠름</td></tr>
+    <tr><td>적합</td><td>어드민/게이트웨이/디버그</td><td>일반 운영 호출</td></tr>
+  </tbody>
+</table>
+
+<blockquote class="good"><p>✅ <strong>권장:</strong> 일반 호출은 <strong>7장(생성 stub)</strong>, "grpcurl을 웹으로"가 목적이면 <strong>4~6장(동적 리플렉션)</strong>.</p></blockquote>
+
+<hr>
+
+<h2 id="s8">8. 안티패턴: subprocess로 grpcurl 실행 (피하세요)</h2>
+
+<p>참고로, "터미널 명령을 그대로 코드에 넣는" 방식은 다음과 같습니다. <strong>권장하지 않습니다.</strong></p>
+
+<pre><code># ❌ 안티패턴 — 이렇게 하지 마세요
+import subprocess
+
+def list_services_bad():
+    result = subprocess.run(
+        ["grpcurl", "-plaintext", "localhost:50051", "list"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.splitlines()  # 텍스트 파싱에 의존 → 취약
+</code></pre>
+
+<blockquote class="bad"><p>문제점은 1장과 같습니다: 프로세스 생성 비용, 텍스트 파싱 취약성, 명령어 주입 위험, 배포 시 grpcurl 바이너리 의존. <strong>4~7장의 코드 기반 방식으로 대체하세요.</strong></p></blockquote>
+
+<hr>
+
+<h2 id="s9">9. 자주 발생하는 오류</h2>
+
+<table>
+  <thead><tr><th>증상</th><th>원인</th><th>해결</th></tr></thead>
+  <tbody>
+    <tr><td><code>ModuleNotFoundError: grpc_reflection</code></td><td><code>grpcio-reflection</code> 미설치</td><td><code>uv add grpcio-reflection</code> 또는 <code>uv sync</code></td></tr>
+    <tr><td><code>ImportError: cannot import name 'ProtoReflectionDescriptorDatabase'</code></td><td>grpcio-reflection 버전이 오래됨</td><td><code>uv add -U grpcio-reflection</code> (1.50+ 권장)</td></tr>
+    <tr><td><code>ImportError: GetMessageClass</code></td><td>protobuf 4.22 미만</td><td>4장 코드의 <code>try/except</code> 분기가 자동 처리(구버전은 <code>MessageFactory().GetPrototype</code>)</td></tr>
+    <tr><td><code>StatusCode.UNIMPLEMENTED</code></td><td><strong>대상 서버에 리플렉션이 꺼져 있음</strong></td><td>서버에서 <code>reflection.enable_server_reflection(...)</code> 활성화 (<code>server.py</code> 참고)</td></tr>
+    <tr><td><code>StatusCode.UNAVAILABLE</code></td><td>서버 미실행/주소·포트 불일치</td><td>서버 먼저 실행, <code>target</code> 주소 확인</td></tr>
+    <tr><td>FastAPI 응답이 느리고 멈춤</td><td>동기 gRPC 호출이 이벤트 루프를 막음</td><td><code>run_in_threadpool</code> 사용(5장) 또는 <code>grpc.aio</code> 채널 사용</td></tr>
+    <tr><td><code>KeyError</code>로 서비스/메서드 못 찾음</td><td>전체 이름(full name) 오타</td><td><code>package.Service</code> 형식 확인 (예: <code>reflection_example.EchoService</code>)</td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<h2 id="summary">정리</h2>
+<ul>
+  <li><code>grpcurl</code>은 <strong>CLI 디버깅 도구</strong>일 뿐, 그 기능(리플렉션 조회 + 동적 호출)은 전부 파이썬 코드로 가능합니다.</li>
+  <li>웹 서버 안에서는 <strong>절대 grpcurl을 <code>subprocess</code>로 실행하지 말고</strong>, <code>grpc_reflection</code> + <code>google.protobuf</code>로 직접 구현하세요(4~6장).</li>
+  <li>proto를 안다면 <strong>미리 생성한 stub</strong>이 가장 안전하고 빠릅니다(7장).</li>
+  <li>FastAPI는 비동기 루프를 막지 않도록 <code>run_in_threadpool</code>/<code>grpc.aio</code>를, Django는 뷰 또는 management 명령으로 감싸면 됩니다.</li>
+</ul>
+
+</div>
+</body>
+</html>
