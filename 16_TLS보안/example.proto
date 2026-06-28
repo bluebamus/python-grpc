@@ -1,0 +1,17 @@
+syntax="proto3";
+
+package example;
+
+service ExampleService{
+    rpc SayHello(HelloRequest)returns(HelloReply);
+}
+
+message HelloRequest{
+    string name=1;
+}
+
+message HelloReply{
+    string message=1;
+}
+
+// uv run python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. example.proto

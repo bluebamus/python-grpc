@@ -1,0 +1,15 @@
+syntax="proto3";
+
+service ExampleService{
+    rpc UnaryCall(ExampleRequest)returns(ExampleResponse){}
+}
+
+message ExampleRequest{
+    string message = 1;
+}
+
+message ExampleResponse{
+    string message = 1;
+}
+
+// uv run python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. example.proto
