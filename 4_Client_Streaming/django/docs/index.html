@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4_Client_Streaming · Django HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#4ade80; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#16a34a,#065f46); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#dcfce7; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#86efac; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#16a34a; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>4_Client_Streaming — Django HTTP→gRPC 게이트웨이 <span class="tag">Django</span></h1>
+  <p>여러 개의 입력을 gRPC 요청 스트림으로 모아 단일 응답으로 집계하는 게이트웨이 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p><strong>클라이언트 스트리밍</strong>은 클라이언트가 여러 개의 메시지를 연속으로
+  보내고, 서버가 그것을 모두 받은 뒤 <strong>단 하나의 응답</strong>으로 집계해 돌려주는
+  패턴입니다. 로그/이벤트 배치 업로드, 센서 측정값 누적, 파일 청크 업로드, 다건
+  트랜잭션의 일괄 집계처럼 "여러 입력 → 하나의 요약"이 필요한 곳에 적합합니다.</p>
+  <p>이 샘플은 앞단에 <strong>HTTP→gRPC 게이트웨이</strong>를 두어, 브라우저/모바일이
+  익숙한 REST(JSON 배열)로 한 번 호출하면 게이트웨이가 그 배열을 gRPC 요청 스트림으로
+  변환해 백엔드의 <code>StreamData</code> 를 호출하고, 집계된 단일 결과를 돌려줍니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON items[])</small></div>
+    <span class="arrow">→</span>
+    <div class="node">Django 게이트웨이<br><small>POST /stream-data</small></div>
+    <span class="arrow">→</span>
+    <div class="node">요청 스트림<br><small>RequestMessage 들을 yield</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>StreamData → 단일 응답</small></div>
+  </div>
+  <p>게이트웨이는 <code>items</code> 의 각 원소를 <code>RequestMessage(data=...)</code> 로
+  하나씩 스트리밍합니다. 서버는 스트림을 끝까지 소비한 뒤 집계 결과를 담은
+  <code>ResponseMessage{result}</code> 하나만 돌려줍니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /stream-data {"items":["a","b","c"]}</code> 호출</li>
+    <li>Django 뷰가 입력 검증 (빈 리스트/비문자열 → <code>422</code>)</li>
+    <li>게이트웨이가 제너레이터로 각 item 을 <code>RequestMessage</code> 로 yield</li>
+    <li>재사용 중인 gRPC 스텁이 <code>StreamData(request_iterator)</code> 로 요청 스트림 전송</li>
+    <li>서버가 모든 요청을 받은 뒤 집계한 <strong>단일</strong> <code>ResponseMessage</code> 반환</li>
+    <li>게이트웨이가 <code>{result, count, elapsed_ms}</code> 로 감싸 HTTP 응답</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>요청 스트림 제너레이터 (grpc_client.py)</h3>
+  <pre><code>def _request_iterator(items):
+    for item in items:
+        yield streaming_pb2.RequestMessage(data=item)
+
+# 단일 응답을 받는다 (요청은 stream, 응답은 1개)
+response = stub.StreamData(_request_iterator(items), timeout=timeout)
+return response.result</code></pre>
+  <h3>gRPC → HTTP 상태코드 매핑 (views.py)</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>백엔드 일시 불가</td></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>타임아웃</td></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>NOT_FOUND</td><td>404</td><td>리소스 없음</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+  <p>입력 검증은 게이트웨이에서 먼저 처리합니다. <code>items</code> 가 비어 있으면 gRPC
+  를 호출하지도 않고 <code>422</code> 로 거절합니다.</p>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>스트림 크기와 메모리</strong>가 핵심입니다. 서버가 스트림을
+  전부 메모리에 모은 뒤 집계하면, 대용량 업로드에서 OOM 위험이 있습니다. 가능하면
+  들어오는 대로 누적(running aggregate)하거나, 게이트웨이/서버에 최대 아이템 수
+  제한을 두세요.</div>
+  <ul>
+    <li><strong>백프레셔(backpressure)</strong>: 클라이언트가 너무 빨리 보내면 서버가
+        밀립니다. gRPC 흐름 제어가 일부 흡수하지만, 게이트웨이에서 배치 크기 상한을
+        두는 것이 안전합니다.</li>
+    <li><strong>부분 실패의 의미</strong>: 클라이언트 스트리밍은 응답이 1개뿐이라
+        "몇 번째 아이템에서 실패했는지"를 표현하기 어렵습니다. 필요하면 서버 응답에
+        처리 개수/스킵 목록 같은 메타데이터를 포함하세요.</li>
+    <li><strong>타임아웃</strong>: <code>timeout</code> 은 스트림 전체에 대한 데드라인입니다.
+        아이템이 많을수록 넉넉히 잡아야 합니다.</li>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. 요청마다 만들지 말고 프로세스
+        수명 동안 재사용하세요(본 샘플은 모듈 레벨 싱글턴).</li>
+    <li><strong>관측성</strong>: 처리한 아이템 수(<code>count</code>)와 소요 시간
+        (<code>elapsed_ms</code>)을 응답/로그에 남기면 성능 추세를 추적할 수 있습니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50054)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run python manage.py runserver
+
+# 통합 테스트 (gRPC 서버를 직접 띄워 집계/검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 "받은 요청들을 모아 개수와 연결 문자열을 result 로 반환"하는
+  결정론적 서버를 띄워, 게이트웨이로 <code>["a","b","c"]</code> 를 보내면
+  <code>count=3;data=a|b|c</code> 가 집계되는지, 빈 리스트는 <code>422</code> 가
+  되는지를 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,18 @@
+syntax = "proto3";                                  // protobuf 문법 버전 선언 (proto3)
+
+package streaming;                                     // 패키지(네임스페이스) 이름, 메시지/서비스 이름 충돌 방지
+
+message RequestMessage{                             // 클라이언트가 보내는 요청 메시지 타입
+    string data = 1;                                // data 필드 (문자열), 태그 번호 1
+}
+
+message ResponseMessage{                            // 서버가 돌려주는 응답 메시지 타입
+    string result = 1;                              // result 필드 (문자열), 태그 번호 1
+}
+
+service StreamingService{                           // StreamingService gRPC 서비스 정의
+    rpc StreamData(stream RequestMessage) returns (ResponseMessage);  // Client Streaming RPC: 요청 stream(여러 개) → 응답 1개
+}
+
+
+// python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. streaming.proto
