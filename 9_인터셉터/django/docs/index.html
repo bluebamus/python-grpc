@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9_인터셉터 · Django HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#4ade80; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#16a34a,#065f46); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#dcfce7; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#86efac; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#16a34a; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>9_인터셉터 — Django HTTP→gRPC 게이트웨이 <span class="tag">Django</span></h1>
+  <p>클라이언트 인터셉터로 로깅·메타데이터 주입 같은 횡단 관심사를 한 곳에 모으는 실무 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>마이크로서비스에서 모든 gRPC 호출에 공통으로 필요한 일들이 있습니다.
+  요청 로깅, 분산 추적용 <code>x-request-id</code> 부여, 인증 토큰 첨부, 메트릭 수집
+  같은 <strong>횡단 관심사(cross-cutting concern)</strong>입니다. 이를 호출부마다
+  복붙하면 누락·불일치가 생깁니다.</p>
+  <p><strong>클라이언트 인터셉터</strong>(<code>grpc.UnaryUnaryClientInterceptor</code>)는
+  이런 로직을 채널 한 곳에 모읍니다. 인터셉터를 채널에 씌우면 그 채널의 모든 unary
+  호출이 자동으로 가로채져, 비즈니스 코드에는 보일러플레이트가 남지 않습니다.
+  본 샘플은 게이트웨이가 백엔드를 호출할 때 인터셉터로 (1) 호출을 로깅하고
+  (2) <code>x-request-id</code> 를 자동 주입합니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">Django 게이트웨이<br><small>POST /echo</small></div>
+    <span class="arrow">→</span>
+    <div class="node">클라이언트 인터셉터<br><small>로깅 + x-request-id 주입</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>EchoService (50059)</small></div>
+  </div>
+  <p>호출은 항상 인터셉터를 거칩니다. 인터셉터가 메타데이터에
+  <code>x-request-id</code> 가 없으면 새로 만들어 주입하고, 서버는 그 값을 받아
+  처리합니다. 본 샘플의 서버는 받은 값을 trailing metadata 로 되돌려주어
+  게이트웨이가 응답에 함께 실어 반환합니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /echo {"message":"Hello"}</code> 호출</li>
+    <li>Django 뷰가 입력 검증 (빈 문자열 → <code>422</code>)</li>
+    <li>게이트웨이가 재사용 중인 gRPC 스텁으로 <code>Echo</code> 호출</li>
+    <li>인터셉터가 가로채 호출을 로깅하고, <code>x-request-id</code> 가 없으면
+        <code>uuid4</code> 로 생성해 메타데이터에 주입(+호출 카운트 증가)</li>
+    <li>서버가 메시지를 echo 하고 <code>x-request-id</code> 를 응답에 반영</li>
+    <li>게이트웨이가 <code>{message, request_id, elapsed_ms}</code> 로 응답.
+        실패 시 gRPC 상태코드를 HTTP 코드로 매핑</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>클라이언트 인터셉터 (grpc_client.py)</h3>
+  <pre><code>class LoggingRequestIdInterceptor(grpc.UnaryUnaryClientInterceptor):
+    def intercept_unary_unary(self, continuation, details, request):
+        metadata = list(details.metadata or [])
+        if not any(k.lower() == "x-request-id" for k, _ in metadata):
+            metadata.append(("x-request-id", uuid.uuid4().hex))   # 자동 주입
+        new_details = _replace_metadata(details, metadata)
+        self._call_count += 1                                       # 실행 증거
+        logger.info("gRPC 호출 시작 ...")
+        response = continuation(new_details, request)               # 실제 호출
+        logger.info("gRPC 호출 종료 ...")
+        return response</code></pre>
+  <h3>채널에 인터셉터 적용</h3>
+  <pre><code>base = grpc.insecure_channel(target)
+channel = grpc.intercept_channel(base, LoggingRequestIdInterceptor())
+stub = EchoServiceStub(channel)   # 이후 모든 호출이 인터셉터를 거친다</code></pre>
+  <p><code>grpc.ClientCallDetails</code> 는 불변이므로, 메타데이터를 추가하려면
+  같은 필드를 가진 새 객체로 교체해야 합니다(본 샘플은 namedtuple 사용).</p>
+  <h3>gRPC → HTTP 상태코드 매핑 (views.py)</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>백엔드 일시 불가</td></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>타임아웃</td></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>인터셉터 체인 순서</strong>가 중요합니다. 여러 인터셉터를
+  적용하면 등록 순서대로 감싸집니다. 인증→로깅→재시도처럼 의존 관계가 있는 로직은
+  순서를 신중히 정하세요.</div>
+  <ul>
+    <li><strong>불변 ClientCallDetails</strong>: 메타데이터를 바꾸려면 새 객체로 교체해야
+        합니다. 기존 메타데이터를 보존한 채 추가만 하세요(덮어쓰기 주의).</li>
+    <li><strong>스트리밍은 별도 인터페이스</strong>: unary-unary 외에 unary-stream,
+        stream-unary, stream-stream 용 인터셉터가 따로 있습니다. 필요한 호출 형태마다
+        구현하세요.</li>
+    <li><strong>예외/상태 처리</strong>: <code>continuation()</code> 이 던지는
+        <code>RpcError</code> 를 인터셉터에서 잡아 로깅/메트릭에 반영할 수 있습니다.
+        단, 의미를 바꾸지 않도록 다시 던지세요.</li>
+    <li><strong>분산 추적</strong>: <code>x-request-id</code>(또는 W3C traceparent)를
+        모든 hop 에 전파하면 로그를 하나의 추적 ID 로 묶을 수 있습니다.</li>
+    <li><strong>관측성</strong>: 인터셉터는 호출 수·지연·에러율을 수집하기 가장 좋은
+        지점입니다. 본 샘플은 <code>call_count</code> 와 <code>elapsed_ms</code> 를 노출합니다.</li>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. 인터셉터를 씌운 채널을 프로세스
+        수명 동안 재사용하세요(본 샘플은 모듈 레벨에서 1회 생성).</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50059)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run python manage.py runserver
+
+# 통합 테스트 (gRPC 서버를 직접 띄워 인터셉터 동작 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 인터셉터가 주입한 <code>x-request-id</code> 가 서버까지 전달되어
+  응답에 되돌아오는지, 그리고 호출마다 <code>call_count</code> 가 증가하는지를
+  결정론적으로 검증합니다(인터셉터가 실제로 실행되었다는 단언).</p>
+</section>
+
+</main>
+</body>
+</html>
