@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3_ServerStreaming · FastAPI HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>3_ServerStreaming — FastAPI HTTP→gRPC 게이트웨이 <span class="tag">FastAPI</span></h1>
+  <p>gRPC 서버 스트리밍(요청 1 → 응답 다수)을 HTTP 스트리밍(SSE)으로 중계하는 실무 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>LLM 토큰 스트리밍, 실시간 알림/피드, 진행률(progress) 전송, 로그 tailing 처럼
+  <strong>하나의 요청에 대해 결과가 여러 조각으로 시간차를 두고 도착</strong>하는
+  상황이 많습니다. 백엔드를 gRPC 서버 스트리밍으로 구현하면 이런 흐름을 자연스럽게
+  표현할 수 있지만, 브라우저는 gRPC 스트림을 직접 받기 어렵습니다.</p>
+  <p>그래서 <strong>HTTP→gRPC 게이트웨이</strong>가 앞단에서 REST 를 노출하고, 내부 gRPC
+  서버 스트림을 받아 <strong>SSE(text/event-stream)</strong> 로 변환해 흘려보냅니다.
+  핵심은 <strong>응답을 모아서 한 번에 주지 않는다</strong>는 점입니다. 서버가 보내는
+  메시지를 받는 즉시 클라이언트로 중계해, 첫 바이트까지의 지연(TTFB)을 줄입니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>SSE 수신</small></div>
+    <span class="arrow">←</span>
+    <div class="node">FastAPI 게이트웨이<br><small>POST /chat-stream<br>StreamingResponse</small></div>
+    <span class="arrow">←</span>
+    <div class="node">gRPC 채널<br><small>스텁 재사용</small></div>
+    <span class="arrow">←</span>
+    <div class="node">gRPC 서버<br><small>ChatService.ChatStream<br>yield ×N</small></div>
+  </div>
+  <p>요청은 1개(<code>{"message":"..."}</code>)지만, 응답은 서버가 <code>yield</code> 하는
+  만큼 여러 개가 stream 으로 돌아옵니다. 게이트웨이의 제너레이터가 이 스트림을
+  순회하며 메시지마다 <code>data: {json}\n\n</code> SSE 이벤트를 yield 합니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /chat-stream {"message":"시작"}</code> 호출</li>
+    <li>FastAPI 가 Pydantic 으로 입력 검증 (빈 문자열 → <code>422</code>)</li>
+    <li>게이트웨이가 재사용 중인 스텁으로 <code>ChatStream</code> 호출 → 응답 <em>iterator</em> 획득</li>
+    <li>첫 메시지를 미리 한 번 당겨(peek) 본다 — 여기서 백엔드가 <code>UNAVAILABLE</code>
+        이면 스트림 시작 전이라 <code>503</code> 으로 매핑 가능</li>
+    <li>이후 <code>StreamingResponse</code> 가 제너레이터를 돌며 도착하는 메시지마다
+        SSE 이벤트를 흘려보내고, 끝나면 <code>event: done</code> 으로 마무리</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>서버 스트림 순회 (grpc_client.py)</h3>
+  <pre><code>def chat_stream(self, message, timeout=None):
+    request = message_pb2.ChatMessage(message=message)
+    call = self._stub.ChatStream(request, timeout=timeout)
+    for response in call:        # 응답이 도착하는 대로 하나씩
+        yield response.message   # 제너레이터로 흘려보냄</code></pre>
+  <h3>SSE 로 중계 (main.py)</h3>
+  <pre><code>def event_generator():
+    for message in stream:
+        yield f"data: {json.dumps({'message': message})}\n\n"
+    yield "event: done\ndata: {...}\n\n"
+
+return StreamingResponse(event_generator(), media_type="text/event-stream")</code></pre>
+  <h3>gRPC → HTTP 상태코드 매핑</h3>
+  <table>
+    <tr><th>발생 시점</th><th>처리</th></tr>
+    <tr><td>스트림 시작 전(첫 메시지 peek) 실패</td><td>HTTP 상태코드로 매핑 (UNAVAILABLE→503 등)</td></tr>
+    <tr><td>스트림 도중 실패</td><td>이미 200 이 나갔으므로 <code>event: error</code> SSE 이벤트로 통지</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>스트림 시작 후에는 HTTP 상태코드를 바꿀 수 없습니다.</strong>
+  첫 바이트를 보내는 순간 상태줄(<code>200</code>)이 확정되므로, 도중 실패는 본문 안의
+  <code>error</code> 이벤트로 알려야 합니다. 본 샘플은 첫 메시지를 미리 당겨(peek) 초기
+  실패만 <code>503</code> 등으로 매핑합니다.</div>
+  <ul>
+    <li><strong>버퍼링 주의</strong>: 중간 프록시(Nginx 등)나 응답 버퍼가 SSE 를 모아버리면
+        스트리밍 효과가 사라집니다. <code>X-Accel-Buffering: no</code>, 압축 비활성 등을 고려하세요.</li>
+    <li><strong>연결 종료/취소 전파</strong>: 클라이언트가 끊으면 gRPC 호출도
+        <code>call.cancel()</code> 로 취소해 백엔드 자원을 낭비하지 않도록 해야 합니다.</li>
+    <li><strong>동기 vs 비동기</strong>: 본 샘플은 동기 스텁을 사용합니다. 동시 스트림이 많으면
+        워커 스레드가 묶일 수 있으니, 대량 트래픽에서는 <code>grpc.aio</code> + async 제너레이터를
+        고려하세요.</li>
+    <li><strong>하트비트</strong>: 메시지 간 간격이 길면 중간 장비가 유휴 연결을 끊을 수 있습니다.
+        주기적인 코멘트(<code>: ping\n\n</code>) 이벤트로 연결을 유지하세요.</li>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. 요청마다 만들지 말고 앱 수명 동안
+        재사용하세요(본 샘플은 lifespan 에서 1회 생성).</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50053)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run uvicorn app.main:app --reload
+
+# SSE 스트림 수신 (-N 으로 버퍼 끄기)
+curl -N -X POST localhost:8000/chat-stream \
+  -H "content-type: application/json" -d '{"message":"시작"}'
+
+# 통합 테스트 (gRPC 서버를 직접 띄워 N개 수신 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 서버가 정확히 N개(예: 3개)를 stream 으로 보낼 때 게이트웨이를 통해
+  클라이언트가 N개를 순서대로 모두 수신하는지(<code>messages == [..#0, ..#1, ..#2]</code>),
+  백엔드 부재 시 <code>503</code> 으로 매핑되는지를 결정론적으로 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
