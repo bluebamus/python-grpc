@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12_서버리플렉션 · Django HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#4ade80; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#16a34a,#065f46); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#dcfce7; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#86efac; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#16a34a; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>12_서버 리플렉션 — Django HTTP→gRPC 게이트웨이 <span class="tag">Django</span></h1>
+  <p>클라이언트가 .proto 없이도 서버에 직접 물어 서비스를 발견하는 게이트웨이 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p><strong>서버 리플렉션(Server Reflection)</strong>은 gRPC 서버가 자신이 노출하는
+  서비스/메서드/메시지 스키마를 런타임에 알려주는 표준 서비스입니다. 클라이언트가
+  미리 컴파일된 <code>.proto</code> 를 갖고 있지 않아도, 서버에 직접 물어
+  "어떤 서비스가 있는지"를 동적으로 알아낼 수 있습니다.</p>
+  <p>실무에서는 <code>grpcurl</code> 같은 디버깅 도구, API 게이트웨이의 동적 라우팅,
+  서비스 디스커버리/카탈로그, 개발용 탐색 UI 등에서 활용됩니다. 이 샘플은 게이트웨이가
+  REST <code>GET /services</code> 요청을 받으면 내부적으로 리플렉션을 호출해 서비스
+  목록을 JSON 으로 돌려줍니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">Django 게이트웨이<br><small>GET /services · POST /echo</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 채널<br><small>Echo + Reflection 스텁</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>EchoService + 리플렉션 ON</small></div>
+  </div>
+  <p><code>/echo</code> 는 평범한 unary 비즈니스 호출이고, <code>/services</code> 는
+  <code>ServerReflectionInfo</code> 양방향 스트리밍 RPC 로 서비스 목록을 받아옵니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>GET /services</code> 호출</li>
+    <li>게이트웨이가 <code>ServerReflectionStub</code> 으로
+        <code>ServerReflectionRequest(list_services="*")</code> 전송</li>
+    <li>서버가 노출 서비스 목록을 응답 스트림으로 반환</li>
+    <li>게이트웨이가 <code>list_services_response.service[].name</code> 을 파싱</li>
+    <li><code>{"services": ["reflection_example.EchoService", ...]}</code> 로 응답</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>서버 측 — 리플렉션 활성화 (server.py / conftest.py)</h3>
+  <pre><code>from grpc_reflection.v1alpha import reflection
+
+SERVICE_NAMES = (
+    reflection_example_pb2.DESCRIPTOR
+        .services_by_name["EchoService"].full_name,  # reflection_example.EchoService
+    reflection.SERVICE_NAME,                           # 리플렉션 서비스 자신
+)
+reflection.enable_server_reflection(SERVICE_NAMES, server)</code></pre>
+  <h3>클라이언트 측 — 서비스 목록 조회 (grpc_client.py)</h3>
+  <pre><code>from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
+
+stub = reflection_pb2_grpc.ServerReflectionStub(channel)
+req = reflection_pb2.ServerReflectionRequest(list_services="*")
+for resp in stub.ServerReflectionInfo(iter([req])):
+    for svc in resp.list_services_response.service:
+        names.append(svc.name)   # "reflection_example.EchoService"</code></pre>
+  <h3>gRPC → HTTP 상태코드 매핑 (views.py)</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>백엔드 불가</td></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>타임아웃</td></tr>
+    <tr><td>UNIMPLEMENTED</td><td>501</td><td>리플렉션 미지원 서버</td></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>보안</strong>이 가장 중요합니다. 리플렉션은 서버의 전체 API
+  스키마를 노출하므로, 공개 인터넷에 무방비로 켜두면 공격 표면이 됩니다. 운영 환경에서는
+  내부망/사설 게이트웨이 뒤에서만 켜거나, 인증된 요청에만 허용하는 것이 안전합니다.</div>
+  <ul>
+    <li><strong>UNIMPLEMENTED 처리</strong>: 리플렉션을 끈 서버에 <code>/services</code>
+        를 호출하면 <code>UNIMPLEMENTED</code> 가 옵니다. 게이트웨이는 이를
+        <code>501</code> 로 매핑해 "이 기능 미지원"임을 명확히 합니다.</li>
+    <li><strong>스트리밍 RPC</strong>: 리플렉션은 양방향 스트리밍입니다. 단일 요청이라도
+        이터레이터로 감싸 보내고, 응답도 스트림으로 받습니다.</li>
+    <li><strong>버전</strong>: 패키지는 <code>v1alpha</code> 와 <code>v1</code> 이 있습니다.
+        도구/서버 호환을 위해 보통 <code>v1alpha</code> 를 함께 켜둡니다.</li>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. Echo 스텁과 리플렉션 스텁은
+        같은 채널을 공유합니다(본 샘플은 모듈 레벨에서 1회 생성).</li>
+    <li><strong>스키마 캐싱</strong>: 매 요청마다 리플렉션을 치면 부하가 됩니다. 서비스
+        목록/디스크립터는 캐시하고 주기적으로만 갱신하는 것이 좋습니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치 (grpcio-reflection 포함)
+uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50062)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run python manage.py runserver
+
+# 통합 테스트 (리플렉션 켠 서버를 직접 띄워 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 리플렉션을 켠 서버를 띄워 <code>/services</code> 응답에
+  <code>reflection_example.EchoService</code> 가 포함되는지(리플렉션으로 서비스가
+  발견되는지)를 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
