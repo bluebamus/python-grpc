@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11_서버상태체크 · FastAPI HTTP→gRPC 헬스체크 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>11_서버상태체크 — FastAPI HTTP→gRPC 헬스체크 게이트웨이 <span class="tag">FastAPI</span></h1>
+  <p>표준 gRPC 헬스체크(grpc.health.v1)를 REST 로 노출해 운영·모니터링에 연결하는 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>마이크로서비스 환경에서 각 서비스는 자신의 서빙 상태를 표준 헬스체크 프로토콜
+  <code>grpc.health.v1.health/Check</code> 로 노출합니다. 쿠버네티스의 liveness/readiness
+  probe, 로드밸런서의 헬스체크, 배포 파이프라인의 준비 확인 등이 이 신호를 사용합니다.</p>
+  <p>하지만 모든 인프라가 gRPC 를 직접 호출할 수 있는 것은 아닙니다. <strong>HTTP→gRPC
+  헬스체크 게이트웨이</strong>는 외부에 단순한 REST 엔드포인트(<code>GET /health/grpc</code>)
+  를 제공하고, 내부적으로 gRPC <code>Check</code> 를 호출해 <strong>ServingStatus 를 HTTP
+  상태코드로 번역</strong>합니다. SERVING 이면 200, 그 외에는 503 으로 매핑하면 표준 HTTP
+  헬스체크를 기대하는 어떤 도구와도 곧바로 연동됩니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">모니터 / LB / probe<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">FastAPI 게이트웨이<br><small>GET /health/grpc</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 채널<br><small>health/Check</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 헬스 서버<br><small>grpc.health.v1</small></div>
+  </div>
+  <p>백엔드가 <code>ServingStatus</code> 를 반환하면 게이트웨이가 이를 HTTP 상태코드로
+  변환합니다. <code>SERVING</code> → <code>200</code>, <code>NOT_SERVING</code> /
+  <code>SERVICE_UNKNOWN</code> / <code>UNKNOWN</code> → <code>503</code>.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>모니터링 도구가 <code>GET /health/grpc?service=api</code> 호출</li>
+    <li>게이트웨이가 재사용 중인 gRPC 스텁으로 <code>Check(service="api")</code> 호출</li>
+    <li>백엔드 헬스 서버가 해당 서비스의 <code>ServingStatus</code> 를 응답</li>
+    <li>게이트웨이가 상태를 HTTP 코드로 매핑 (SERVING→200, 그 외→503)</li>
+    <li>Check 자체가 gRPC 에러(예: NOT_FOUND, UNAVAILABLE)로 끝나면 에러 매핑 테이블로 변환</li>
+  </ol>
+  <p>게이트웨이 자체의 살아있음은 별도로 <code>GET /health</code> 가 항상 200 으로
+  알려줍니다(백엔드 상태와 무관).</p>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>표준 헬스체크 호출 (grpc_client.py)</h3>
+  <pre><code>request = health_check_pb2.HealthCheckRequest(service=service)
+response = stub.Check(request, timeout=timeout)
+return response.status   # ServingStatus(int)</code></pre>
+  <h3>ServingStatus → HTTP 매핑 (main.py)</h3>
+  <table>
+    <tr><th>ServingStatus</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>SERVING</td><td>200</td><td>정상 서빙 중</td></tr>
+    <tr><td>NOT_SERVING</td><td>503</td><td>서빙 불가(준비 안 됨/장애)</td></tr>
+    <tr><td>SERVICE_UNKNOWN</td><td>503</td><td>등록되지 않은 서비스</td></tr>
+    <tr><td>UNKNOWN</td><td>503</td><td>상태 불명</td></tr>
+  </table>
+  <h3>gRPC 에러 → HTTP 매핑</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td></tr>
+    <tr><td>NOT_FOUND</td><td>404</td></tr>
+    <tr><td>(기타)</td><td>500</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>liveness 와 readiness 를 구분</strong>하세요. liveness 는 "프로세스가
+  살아있나"(죽었으면 재시작), readiness 는 "트래픽을 받을 준비가 됐나"(아니면 LB 에서 제외)
+  입니다. 같은 200/503 매핑이라도 두 probe 가 가리키는 서비스명/의미를 분리해 두는 것이 안전합니다.</div>
+  <ul>
+    <li><strong>타임아웃은 짧게</strong>: 헬스체크는 빨라야 합니다. <code>Check</code> 데드라인을
+        수 초 이하로 두어 느린 백엔드가 게이트웨이를 막지 않게 하세요(본 샘플 기본 2초).</li>
+    <li><strong>Watch 스트리밍</strong>: 폴링 대신 <code>Watch</code> 로 상태 변화를 구독하면
+        상태 전이를 즉시 받을 수 있습니다. SSE/WebSocket 으로 프런트에 중계하기 좋습니다.</li>
+    <li><strong>게이트웨이 자체 헬스 분리</strong>: <code>/health</code> 는 백엔드와 무관하게 200
+        이어야 합니다. 그래야 "게이트웨이는 살아있지만 백엔드가 죽음"을 구분할 수 있습니다.</li>
+    <li><strong>503 의 캐시 금지</strong>: 헬스 응답에 캐시가 끼면 장애 복구가 늦게 반영됩니다.
+        프록시/CDN 에서 헬스 경로는 캐시하지 않도록 하세요.</li>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. 요청마다 만들지 말고 앱 수명 동안
+        재사용하세요(본 샘플은 lifespan 에서 1회 생성).</li>
+    <li><strong>인증/노출 범위</strong>: 헬스 엔드포인트가 내부 토폴로지를 흘리지 않게, 외부
+        노출 시 서비스명 목록·상세 사유는 최소화하세요.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 헬스체크 서버 (상위 폴더 예제, 포트 50061)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run uvicorn app.main:app --reload
+
+# 통합 테스트 (헬스 서버를 직접 띄워 상태/매핑 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 서비스명→상태 매핑을 지정한 결정론적 헬스 서버로,
+  SERVING→200, NOT_SERVING→503, 알 수 없는 서비스→503 매핑이 실제로 일어나는지
+  결정론적으로 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
