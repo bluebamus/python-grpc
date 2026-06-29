@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package e2e_chat;
+
+// 3_ServerStreaming(서버 스트리밍)과 5_Bidirectional(양방향)을 한 하니스에서
+// 브라우저로 검증하기 위해 두 RPC 를 함께 정의한다.
+service ChatService {
+    // 서버 스트리밍: 요청 1개 → 응답 여러 개 (브라우저에서 SSE 로 소비)
+    rpc ServerStream(ChatMessage) returns (stream ChatMessage);
+    // 양방향 스트리밍: 요청 stream ↔ 응답 stream (브라우저에서 WebSocket 으로 소비)
+    rpc BiDi(stream ChatMessage) returns (stream ChatMessage);
+}
+
+message ChatMessage {
+    string message = 1;
+}

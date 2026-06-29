@@ -13,6 +13,10 @@ env/
 # uv
 .uv/
 
+# pytest / playwright
+.pytest_cache/
+test-results/
+
 # IDE
 .vscode/
 .idea/
