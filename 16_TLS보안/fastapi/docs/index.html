@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16_TLS보안 · FastAPI HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>16_TLS보안 — FastAPI HTTP→gRPC 게이트웨이 <span class="tag">FastAPI</span></h1>
+  <p>게이트웨이와 백엔드 사이 통신을 TLS 로 암호화·인증하는 실무 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>마이크로서비스 사이의 트래픽도 신뢰할 수 없는 네트워크를 지납니다. 사내망이라도
+  <strong>도청(eavesdropping)</strong>·<strong>중간자 공격(MITM)</strong>·서비스 사칭을
+  막으려면 서비스 간 통신을 <strong>TLS</strong> 로 암호화하고 서버 신원을 인증해야 합니다.</p>
+  <p>이 샘플은 <strong>HTTP→gRPC 게이트웨이</strong>가 외부에는 REST 를 노출하면서,
+  내부 gRPC 백엔드에는 <code>grpc.secure_channel</code> 로 연결합니다. 평문
+  <code>insecure_channel</code> 이 아니라, 서버 인증서를 검증한 뒤에만 RPC 가 흐릅니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">FastAPI 게이트웨이<br><small>POST /hello</small></div>
+    <span class="arrow">🔒 TLS</span>
+    <div class="node">보안 gRPC 채널<br><small>인증서 검증</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>ExampleService (TLS 포트)</small></div>
+  </div>
+  <p>게이트웨이↔백엔드 구간이 TLS 로 보호됩니다. 인증서 검증에 실패하면 핸드셰이크
+  단계에서 막혀 RPC 자체가 시작되지 못합니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /hello {"name":"World"}</code> 호출</li>
+    <li>FastAPI 가 Pydantic 으로 입력 검증 (빈 문자열 → <code>422</code>)</li>
+    <li>게이트웨이가 루트 인증서(<code>server.crt</code>)로 만든 보안 채널의 스텁으로
+        <code>SayHello</code> 호출</li>
+    <li>첫 호출 시 <strong>TLS 핸드셰이크</strong>: 서버 인증서를 받아 루트로 검증하고,
+        호스트네임(SAN/CN)이 target 과 일치하는지 확인</li>
+    <li>검증 성공 시 암호화된 채널로 요청/응답 교환, 결과를 HTTP 로 반환</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>TLS 보안 채널 생성 (grpc_client.py)</h3>
+  <pre><code>with open(settings.grpc_root_cert, "rb") as f:
+    root_certificates = f.read()
+
+credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+
+options = []
+if settings.grpc_ssl_target_name_override:   # 자체서명 CN 불일치 시
+    options.append(("grpc.ssl_target_name_override",
+                    settings.grpc_ssl_target_name_override))
+
+channel = grpc.secure_channel(target, credentials, options=options)  # insecure 아님</code></pre>
+  <h3>자체서명 인증서와 호스트네임 검증</h3>
+  <p>자체서명 인증서는 공인 CA 가 서명하지 않았으므로, 클라이언트가 그 인증서 자신을
+  <strong>루트(root)</strong> 로 신뢰하도록 <code>root_certificates</code> 에 넣어줍니다.
+  또한 인증서의 <code>CN/SAN</code> 과 접속 호스트가 달라 검증이 실패하면
+  <code>grpc.ssl_target_name_override</code> 로 검증 대상 이름을 인증서 값으로
+  바꿉니다. (이 샘플 인증서는 <code>CN=localhost, SAN=localhost</code> 라
+  <code>localhost</code> 접속 시 오버라이드가 필요 없습니다.)</p>
+  <h3>gRPC → HTTP 상태코드 매핑 (main.py)</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>연결/핸드셰이크 실패 등</td></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>타임아웃</td></tr>
+    <tr><td>UNAUTHENTICATED</td><td>401</td><td>인증 실패</td></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>인증서 관리가 핵심</strong>입니다. 인증서 경로·내용을 코드에
+  하드코딩하지 말고 설정/시크릿 매니저로 분리하고, 만료 전 갱신(rotation) 자동화를
+  반드시 갖추세요. 만료된 인증서는 서비스 전체 장애로 이어집니다.</div>
+  <ul>
+    <li><strong>자체서명 vs 사설 CA</strong>: 데모는 자체서명으로 충분하지만, 실무에서는
+        사내 CA(혹은 cert-manager/Vault)로 발급해 신뢰 체인을 관리하세요.</li>
+    <li><strong>mTLS(상호 인증)</strong>: 더 강한 보안이 필요하면 서버뿐 아니라 클라이언트
+        인증서까지 검증하는 mTLS 를 적용합니다(<code>ssl_server_credentials</code> 의
+        <code>require_client_auth=True</code> + 클라이언트 call credentials).</li>
+    <li><strong>호스트네임 검증을 끄지 말 것</strong>: <code>ssl_target_name_override</code>
+        는 검증을 우회하는 게 아니라 '검증 대상 이름'만 바꾸는 것입니다. 인증서 SAN 을
+        올바로 발급하는 편이 정석이며, 검증 자체를 비활성화해선 안 됩니다.</li>
+    <li><strong>채널 재사용</strong>: TLS 핸드셰이크는 비쌉니다. 채널을 요청마다 만들지 말고
+        앱 수명 동안 재사용하세요(본 샘플은 lifespan 에서 1회 생성).</li>
+    <li><strong>관측성</strong>: 핸드셰이크 실패·인증서 만료 임박을 메트릭/알람으로 노출해야
+        "조용한 인증서 사고"를 예방할 수 있습니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 TLS gRPC 서버 (상위 폴더 예제, server.key/server.crt 사용)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run uvicorn app.main:app --reload
+
+# 통합 테스트 (TLS 서버를 직접 띄워 보안 채널 호출을 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 <code>add_secure_port</code> 로 TLS gRPC 서버를 50066 에 띄우고,
+  게이트웨이가 <code>secure_channel</code> 로 호출해 <code>Hello, World!</code> 를
+  받는지 확인합니다. 또한 같은 포트에 평문 채널로 접속하면 거부되는 것을 확인해
+  <strong>insecure 가 아님</strong>을 분명히 증명합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
