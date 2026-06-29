@@ -1,0 +1,17 @@
+syntax="proto3";
+
+package wait_example;
+
+service EchoService{
+    rpc Echo(EchoRequest)returns(EchoResponse);
+}
+
+message EchoRequest{
+    string message=1;
+}
+
+message EchoResponse{
+    string message=1;
+}
+
+// uv run python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. wait_example.proto

@@ -1,0 +1,26 @@
+[project]
+name = "grpc-timeout-keepalive-django-gateway"
+version = "0.1.0"
+description = "Django HTTP->gRPC 게이트웨이 샘플 (13_타임아웃설정과통신연결유지기법)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "django>=5.1",
+    "grpcio>=1.80.0",
+    "grpcio-tools>=1.80.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-django>=4.9.0",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.uv]
+package = false

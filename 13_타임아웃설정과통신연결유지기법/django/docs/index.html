@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13_타임아웃설정과통신연결유지기법 · Django HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#4ade80; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#16a34a,#065f46); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#dcfce7; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#86efac; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#16a34a; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>13_타임아웃설정과통신연결유지기법 — Django HTTP→gRPC 게이트웨이 <span class="tag">Django</span></h1>
+  <p>per-call 데드라인과 keepalive 로 "느린 백엔드"와 "죽은 연결"을 실무에서 다루는 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>Django 로 운영 중인 웹/관리자 서비스가 내부 gRPC 마이크로서비스를 호출할 때,
+  백엔드가 가끔 느려지면(GC, 콜드 캐시, 일시 과부하) 요청 스레드가 무한정 묶여 장애가
+  전파됩니다. 각 호출에 <strong>per-call deadline(timeout)</strong> 을 걸어 빠르게 실패시키면
+  이를 막을 수 있고, gRPC 의 <code>DEADLINE_EXCEEDED</code> 를 <strong>HTTP 504</strong> 로
+  변환해 클라이언트에 일관된 의미로 알립니다.</p>
+  <p>게이트웨이는 채널을 오래 재사용하므로, 유휴 구간에 연결이 조용히 끊기는 것을 막기 위해
+  <strong>keepalive</strong> 옵션으로 주기적 PING 을 보내 연결을 살립니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">Django 뷰<br><small>POST /echo</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 채널<br><small>keepalive + deadline</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>EchoService</small></div>
+  </div>
+  <p>채널/스텁은 <code>get_client()</code> 로 프로세스 단위 재사용됩니다(keepalive 로 장수명 유지).
+  요청마다 데드라인을 적용하며, 백엔드가 데드라인을 넘기면 뷰가 <code>504</code> 로 변환합니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /echo {"message":"Hello","deadline_ms":1000}</code> 호출</li>
+    <li>Django 뷰가 JSON 파싱·검증 (빈 문자열 → <code>422</code>)</li>
+    <li><code>get_client()</code> 로 재사용 중인 gRPC 스텁의 <code>Echo(request, timeout=...)</code> 호출</li>
+    <li>백엔드가 데드라인 안에 응답하면 결과를 그대로 반환</li>
+    <li>데드라인 초과 시 gRPC 가 <code>DEADLINE_EXCEEDED</code> → 뷰가 <code>504</code> 로 매핑</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>설정 분리 (config/settings.py)</h3>
+  <pre><code>GRPC_TARGET = os.environ.get("GRPC_TARGET", "localhost:50063")
+GRPC_DEFAULT_DEADLINE_MS = int(os.environ.get("GRPC_DEFAULT_DEADLINE_MS", "1000"))
+GRPC_KEEPALIVE_TIME_MS = int(os.environ.get("GRPC_KEEPALIVE_TIME_MS", "10000"))
+# ... keepalive_timeout_ms / permit_without_calls / max_pings_without_data</code></pre>
+  <h3>keepalive + 채널 재사용 (gateway/grpc_client.py)</h3>
+  <pre><code>options = [
+    ("grpc.keepalive_time_ms", settings.GRPC_KEEPALIVE_TIME_MS),
+    ("grpc.keepalive_timeout_ms", settings.GRPC_KEEPALIVE_TIMEOUT_MS),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.http2.max_pings_without_data", 0),
+]
+channel = grpc.insecure_channel(target, options=options)
+
+def get_client():           # 채널 1회 생성 후 프로세스 단위 재사용
+    global _client
+    if _client is None:
+        _client = GrpcClient()
+    return _client</code></pre>
+  <h3>per-call deadline (gateway/grpc_client.py)</h3>
+  <pre><code>timeout_s = deadline_ms / 1000.0   # gRPC timeout 은 초 단위 float
+response = stub.Echo(EchoRequest(message=message), timeout=timeout_s)</code></pre>
+  <h3>gRPC → HTTP 상태코드 매핑 (gateway/views.py)</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>데드라인 초과 (느린 백엔드)</td></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>백엔드 일시 불가</td></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>WSGI 동기 모델</strong>: Django 동기 뷰에서 gRPC 동기 호출은 요청
+  스레드를 블로킹합니다. 데드라인이 너무 길면 느린 백엔드가 워커 스레드를 모두 묶어버립니다.
+  <strong>데드라인을 짧게·합리적으로</strong> 두는 것이 스레드 고갈을 막는 1차 방어선입니다.</div>
+  <ul>
+    <li><strong>데드라인 전파</strong>: A→B→C 호출 체인에서 남은 데드라인이 전파되어 이미 늦은
+        요청에 추가 작업을 쌓지 않습니다. 각 단계 데드라인을 일관되게 설계하세요.</li>
+    <li><strong>채널과 fork</strong>: gunicorn prefork 시 채널은 <em>fork 이후</em>(워커 안)에서
+        만들어야 합니다. 본 샘플의 지연 생성(<code>get_client</code>)이 이를 만족합니다.</li>
+    <li><strong>keepalive 과도 설정 주의</strong>: PING 주기가 서버의
+        <code>min_time_between_pings_ms</code> 보다 짧으면 <code>too_many_pings</code> 로
+        연결이 끊깁니다. 서버 설정과 맞추세요.</li>
+    <li><strong>유휴 연결과 LB/방화벽</strong>: 중간 장비 idle timeout 보다 짧은 주기로
+        keepalive 를 보내야 연결이 조용히 끊기는 것을 막습니다.</li>
+    <li><strong>서버 측 취소 처리</strong>: 데드라인 초과 시 서버는 <code>context.is_active()</code>
+        로 취소를 감지해 불필요한 작업을 중단해야 자원이 낭비되지 않습니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code>uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50063 으로)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run python manage.py runserver
+
+# 통합 테스트
+uv run pytest</code></pre>
+  <p>통합 테스트는 서버가 일부러 2초 <code>sleep</code> 하도록 만들고 200ms 데드라인으로
+  호출해, <code>DEADLINE_EXCEEDED</code> 가 <code>504</code> 로 매핑되는지 결정론적으로
+  검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
