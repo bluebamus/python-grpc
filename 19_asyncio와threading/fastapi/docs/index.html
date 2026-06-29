@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19_asyncio와threading · FastAPI asyncio 작업 큐</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>19_asyncio와threading — FastAPI asyncio 작업 큐 <span class="tag">FastAPI</span></h1>
+  <p>asyncio.Queue 기반 producer/consumer 를 웹 서비스 작업 큐로 실무화하는 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — asyncio vs threading, 언제 무엇을</h2>
+  <p>이 예제는 동시성 데모 <code>server_asyncio.py</code>(asyncio.Queue)와
+  <code>server_threading.py</code>(queue.Queue + threading)를 각각 웹 서비스의
+  <strong>producer/consumer 작업 큐</strong>로 옮긴 것입니다. 본 FastAPI 샘플은
+  <strong>asyncio 모델</strong>을 담당합니다.</p>
+  <table>
+    <tr><th>구분</th><th>asyncio (이 샘플)</th><th>threading (Django 샘플)</th></tr>
+    <tr><td>실행 단위</td><td>단일 스레드 + 이벤트 루프 위의 코루틴</td><td>여러 OS 스레드</td></tr>
+    <tr><td>전환 시점</td><td><code>await</code> 지점에서만(협력적)</td><td>OS 스케줄러가 선점적으로</td></tr>
+    <tr><td>큐</td><td><code>asyncio.Queue</code> (put/get이 await)</td><td><code>queue.Queue</code> (차단형 get)</td></tr>
+    <tr><td>공유 상태 보호</td><td>락 불필요(단일 스레드)</td><td>복합 연산은 락 필요</td></tr>
+    <tr><td>강점</td><td>대량 I/O 동시성, 적은 메모리</td><td>블로킹 라이브러리와 호환, 단순한 모델</td></tr>
+  </table>
+  <p>판단 기준: <strong>I/O 바운드 + 고동시성</strong>이고 라이브러리가 async를
+  지원하면 asyncio가 유리합니다. 반대로 동기/블로킹 라이브러리만 있거나
+  <strong>CPU 바운드</strong>라면 threading(또는 멀티프로세스)이 현실적입니다.</p>
+</section>
+
+<section>
+  <h2>2. 구조</h2>
+  <div class="flow">
+    <div class="node">HTTP 요청<br><small>POST /tasks</small></div>
+    <span class="arrow">→</span>
+    <div class="node">producer<br><small>queue.submit()</small></div>
+    <span class="arrow">→</span>
+    <div class="node">asyncio.Queue<br><small>인메모리</small></div>
+    <span class="arrow">→</span>
+    <div class="node">consumer 코루틴<br><small>lifespan에서 기동</small></div>
+    <span class="arrow">→</span>
+    <div class="node">작업 저장소<br><small>status/result</small></div>
+  </div>
+  <p>요청 처리와 consumer 코루틴은 <strong>같은 이벤트 루프</strong> 위에서
+  협력적으로 동시에 돕니다. <code>app/worker.py</code>가 큐·저장소·consumer를
+  캡슐화하고, <code>app/main.py</code>의 lifespan이 기동/셧다운을 관리합니다.</p>
+</section>
+
+<section>
+  <h2>3. 작업 흐름 (producer → queue → consumer)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /tasks {"payload":"hello"}</code> 호출</li>
+    <li>핸들러(producer)가 <code>await queue.submit()</code>으로 작업을 큐에 넣고
+        <code>{"task_id":1,"queued":true}</code>를 <code>202</code>로 즉시 반환</li>
+    <li>백그라운드 consumer 코루틴이 <code>await queue.get()</code>으로 작업을 꺼냄
+        (대기 중에는 제어를 루프에 넘겨 다른 요청이 처리됨)</li>
+    <li>블로킹 처리 함수는 <code>asyncio.to_thread()</code>로 별도 스레드에서 실행</li>
+    <li>상태가 <code>queued → processing → done</code>으로 바뀌고 결과가 저장됨</li>
+    <li>클라이언트가 <code>GET /tasks/1</code>로 결과를, <code>GET /stats</code>로 통계를 조회</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>asyncio.Queue + await (worker.py)</h3>
+  <pre><code># producer: await put — 큐가 가득 찼을 때만 대기(백프레셔)
+async def submit(self, payload):
+    task_id = next(self._ids)
+    self._tasks[task_id] = {"status": "queued", ...}
+    await self._queue.put(task_id)
+    return task_id
+
+# consumer: await get — 항목이 올 때까지 비동기 대기(busy-wait 없음)
+async def _consume(self):
+    while True:
+        task_id = await self._queue.get()
+        record["status"] = "processing"
+        result = await asyncio.to_thread(_blocking_process, ...)  # 블로킹은 to_thread!
+        record["status"] = "done"
+        self._queue.task_done()</code></pre>
+  <div class="warn"><strong>블로킹 호출은 반드시 <code>asyncio.to_thread()</code>로 감싼다.</strong>
+  데모 <code>server_asyncio.py</code>가 <code>input()</code>을 <code>to_thread</code>로 감싼 이유와
+  같습니다. <code>time.sleep()</code>·동기 DB 드라이버·<code>requests</code> 같은 동기 호출을
+  코루틴에서 그냥 부르면, 그 시간 동안 <strong>이벤트 루프 전체가 멈춰</strong> 다른 요청과
+  consumer가 모두 정지합니다. to_thread는 호출을 별도 스레드로 던지고 <code>await</code>로
+  완료를 기다려 루프를 살려 둡니다.</div>
+  <table>
+    <tr><th>패턴</th><th>asyncio</th><th>threading</th></tr>
+    <tr><td>큐 넣기</td><td><code>await queue.put(x)</code></td><td><code>queue.put(x)</code></td></tr>
+    <tr><td>큐 꺼내기</td><td><code>await queue.get()</code></td><td><code>queue.get()</code> (차단)</td></tr>
+    <tr><td>블로킹 작업</td><td><code>await asyncio.to_thread(fn)</code></td><td>스레드가 직접 실행</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <ul>
+    <li><strong>GIL</strong>: CPython은 한 번에 한 스레드만 파이썬 바이트코드를 실행합니다.
+        asyncio는 애초에 단일 스레드라 GIL 경합이 없지만, <strong>CPU 바운드</strong>
+        작업은 to_thread로 옮겨도 GIL 때문에 병렬 가속이 안 됩니다. CPU 바운드는
+        <code>ProcessPoolExecutor</code>/멀티프로세스가 정답입니다.</li>
+    <li><strong>I/O vs CPU 바운드</strong>: 네트워크/디스크 대기가 많은 I/O 바운드는
+        asyncio가 적은 자원으로 높은 동시성을 냅니다. CPU 바운드는 멀티프로세스로.</li>
+    <li><strong>백프레셔(backpressure)</strong>: <code>asyncio.Queue(maxsize=N)</code>으로
+        상한을 두면 큐가 가득 찰 때 <code>await put</code>이 대기하여 producer 속도를
+        자동으로 늦춥니다(설정 <code>WORKER_QUEUE_MAXSIZE</code>). 무제한 큐는 폭주 시
+        메모리를 잠식합니다.</li>
+    <li><strong>그레이스풀 셧다운</strong>: 본 샘플은 lifespan 종료 시
+        <code>queue.join()</code>으로 남은 작업을 모두 처리한 뒤 consumer를 취소합니다.
+        그냥 종료하면 큐에 남은 작업이 유실됩니다.</li>
+    <li><strong>인메모리 큐의 한계</strong>: 큐와 결과가 <strong>프로세스 메모리</strong>에만
+        있습니다. Uvicorn/Gunicorn을 <code>--workers N</code>으로 띄우면 워커마다 큐가
+        따로 생겨, A 워커에 넣은 작업을 B 워커가 못 봅니다. 재시작하면 큐가 사라지고
+        재시도/영속성도 없습니다.</li>
+    <li><strong>실무 권장</strong>: 멀티프로세스/멀티호스트로 확장하거나 작업을 잃으면 안
+        된다면 <strong>Celery + Redis/RabbitMQ</strong>, <strong>Dramatiq</strong>, <strong>arq</strong>
+        같은 외부 브로커 기반 큐를 씁니다. 본 샘플은 단일 프로세스 데모/학습용입니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 서버 기동
+uv run uvicorn app.main:app --reload
+
+# 작업 투입 / 조회
+curl -X POST localhost:8000/tasks -H "content-type: application/json" -d '{"payload":"hello"}'
+curl localhost:8000/tasks/1
+curl localhost:8000/stats
+
+# 통합 테스트 (순수 HTTP, gRPC 불필요)
+uv run pytest</code></pre>
+  <p>통합 테스트는 작업 투입 후 consumer가 <code>done</code>으로 처리하는지,
+  여러 작업 투입 시 <code>/stats</code>의 처리 카운트가 증가하는지, 그리고
+  <strong>동시에 투입한 작업이 이벤트 루프를 막지 않고 전부 처리</strong>되는지
+  (<code>test_concurrent_submissions_do_not_block_event_loop</code>)를 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>

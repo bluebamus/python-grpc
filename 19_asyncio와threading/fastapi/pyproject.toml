@@ -1,0 +1,26 @@
+[project]
+name = "asyncio-task-queue-fastapi"
+version = "0.1.0"
+description = "FastAPI asyncio.Queue 작업 큐 샘플 (19_asyncio와threading)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.27.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.uv]
+package = false

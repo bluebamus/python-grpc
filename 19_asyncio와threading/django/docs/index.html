@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19_asyncio와threading · Django threading 작업 큐</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#4ade80; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#16a34a,#065f46); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#dcfce7; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#86efac; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#16a34a; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>19_asyncio와threading — Django threading 작업 큐 <span class="tag">Django</span></h1>
+  <p>queue.Queue + 데몬 스레드 producer/consumer 를 웹 서비스 작업 큐로 실무화하는 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — asyncio vs threading, 언제 무엇을</h2>
+  <p>이 예제는 동시성 데모 <code>server_asyncio.py</code>(asyncio.Queue)와
+  <code>server_threading.py</code>(queue.Queue + threading)를 각각 웹 서비스의
+  <strong>producer/consumer 작업 큐</strong>로 옮긴 것입니다. 본 Django 샘플은
+  <strong>threading 모델</strong>을 담당합니다.</p>
+  <table>
+    <tr><th>구분</th><th>threading (이 샘플)</th><th>asyncio (FastAPI 샘플)</th></tr>
+    <tr><td>실행 단위</td><td>여러 OS 스레드</td><td>단일 스레드 + 이벤트 루프 코루틴</td></tr>
+    <tr><td>전환 시점</td><td>OS 스케줄러가 선점적으로</td><td><code>await</code> 지점에서만(협력적)</td></tr>
+    <tr><td>큐</td><td><code>queue.Queue</code> (차단형 get)</td><td><code>asyncio.Queue</code> (put/get이 await)</td></tr>
+    <tr><td>공유 상태 보호</td><td>복합 연산은 <code>threading.Lock</code> 필요</td><td>락 불필요(단일 스레드)</td></tr>
+    <tr><td>강점</td><td>블로킹 라이브러리와 호환, 단순한 모델</td><td>대량 I/O 동시성, 적은 메모리</td></tr>
+  </table>
+  <p>Django의 기본 WSGI 스택은 <strong>동기/블로킹</strong>입니다. 무거운 작업을
+  요청 안에서 직접 처리하면 워커가 묶이므로, 별도 <strong>consumer 스레드</strong>에
+  위임하고 요청은 즉시 <code>task_id</code>만 돌려주는 패턴이 자연스럽습니다.</p>
+</section>
+
+<section>
+  <h2>2. 구조</h2>
+  <div class="flow">
+    <div class="node">HTTP 요청<br><small>POST /tasks</small></div>
+    <span class="arrow">→</span>
+    <div class="node">producer<br><small>worker.submit()</small></div>
+    <span class="arrow">→</span>
+    <div class="node">queue.Queue<br><small>thread-safe</small></div>
+    <span class="arrow">→</span>
+    <div class="node">consumer 스레드<br><small>데몬, 앱 로드시 1회</small></div>
+    <span class="arrow">→</span>
+    <div class="node">작업 저장소<br><small>Lock 보호</small></div>
+  </div>
+  <p>요청은 WSGI 워커 스레드에서, 작업 처리는 별도 consumer 데몬 스레드에서
+  진행됩니다. <code>gateway/worker.py</code>가 큐·저장소·스레드를 캡슐화하고,
+  <code>gateway/apps.py</code>의 <code>ready()</code>가 <code>start_worker()</code>로
+  consumer를 1회 기동합니다(중복 기동 방지 가드 내장).</p>
+</section>
+
+<section>
+  <h2>3. 작업 흐름 (producer → queue → consumer)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /tasks {"payload":"hello"}</code> 호출</li>
+    <li>뷰(producer)가 <code>worker.submit()</code>으로 작업을 큐에 넣고
+        <code>{"task_id":1,"queued":true}</code>를 <code>202</code>로 즉시 반환</li>
+    <li>데몬 consumer 스레드가 차단형 <code>queue.get()</code>으로 작업을 꺼냄
+        (큐가 비면 항목이 올 때까지 대기, busy-wait 없음)</li>
+    <li><code>_process()</code>가 작업을 처리(블로킹). 락 밖에서 처리해 다른 스레드를 막지 않음</li>
+    <li>상태가 <code>queued → processing → done</code>으로 바뀌고 결과가 저장됨(락 보호)</li>
+    <li>클라이언트가 <code>GET /tasks/1</code>로 결과를, <code>GET /stats</code>로 통계를 조회</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>queue.Queue + 차단형 get + Lock (worker.py)</h3>
+  <pre><code># producer: thread-safe 큐에 넣는다(락 불필요 — Queue가 내부에서 처리)
+def submit(payload):
+    with _lock:                 # 단, 작업 저장소(dict)/카운터는 직접 락으로 보호
+        task_id = next(_ids)
+        _tasks[task_id] = {"status": "queued", ...}
+    _queue.put(task_id)
+    return task_id
+
+# consumer: 차단형 get — 큐가 빌 때까지 대기(busy-wait 없음)
+def _consume():
+    while True:
+        task_id = _queue.get()
+        with _lock: _tasks[task_id]["status"] = "processing"
+        result = _process(payload)        # 락 밖에서 블로킹 처리
+        with _lock:
+            _tasks[task_id]["result"] = result
+            _tasks[task_id]["status"] = "done"
+        _queue.task_done()
+
+# 중복 기동 방지 가드: ready()가 여러 번 불려도 스레드는 하나만
+def start_worker():
+    with _start_lock:
+        if _started: return
+        threading.Thread(target=_consume, daemon=True).start()</code></pre>
+  <div class="warn"><strong>asyncio와의 대비</strong>: asyncio 샘플은 단일 스레드라 작업
+  저장소 접근에 락이 필요 없지만, threading 샘플은 여러 스레드가 같은 dict/카운터를
+  건드리므로 <strong>읽고-쓰는 복합 연산을 <code>Lock</code>으로 보호</strong>해야 합니다.
+  또한 asyncio가 블로킹을 <code>asyncio.to_thread</code>로 옮겨야 했던 것과 달리,
+  threading 모델에서는 블로킹이 <strong>해당 스레드만</strong> 멈출 뿐 다른 스레드는
+  OS 스케줄러가 계속 돌립니다.</div>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <ul>
+    <li><strong>GIL</strong>: CPython은 한 번에 한 스레드만 파이썬 바이트코드를 실행합니다.
+        그래서 스레드는 <strong>I/O 바운드</strong>(대기 중 GIL 해제)에는 효과적이지만,
+        <strong>CPU 바운드</strong>는 스레드를 늘려도 병렬 가속이 거의 없습니다. CPU 바운드는
+        <code>multiprocessing</code>/<code>ProcessPoolExecutor</code>가 정답입니다.</li>
+    <li><strong>I/O vs CPU 바운드</strong>: 외부 API 호출·DB 등 I/O 바운드 작업을
+        백그라운드 스레드로 빼면 요청 워커를 묶지 않습니다. CPU 바운드는 멀티프로세스로.</li>
+    <li><strong>백프레셔(backpressure)</strong>: <code>queue.Queue(maxsize=N)</code>으로
+        상한을 두면 큐가 가득 찰 때 <code>put</code>이 차단되어 producer를 늦춥니다.
+        무제한 큐는 폭주 시 메모리를 잠식합니다.</li>
+    <li><strong>그레이스풀 셧다운</strong>: 데몬 스레드는 프로세스 종료 시 즉시 정리되지만,
+        진행 중 작업이 잘릴 수 있습니다. 안전하게 끝내려면 sentinel을 큐에 넣어 루프를
+        빠져나오게 하고(데모 <code>server_threading.py</code> 참고) <code>join()</code>으로
+        대기하는 셧다운 훅을 둡니다.</li>
+    <li><strong>인메모리 큐 + 멀티프로세스 워커의 한계</strong>: 큐와 결과가
+        <strong>프로세스 메모리</strong>에만 있습니다. Gunicorn/uWSGI를 여러 워커
+        프로세스로 띄우면 워커마다 큐가 따로 생겨, A 워커에 넣은 작업을 B 워커가 못
+        봅니다(<code>GET /tasks/{id}</code>가 다른 워커로 라우팅되면 404). 재시작하면 큐가
+        사라지고 영속성/재시도도 없습니다.</li>
+    <li><strong>실무 권장</strong>: 멀티프로세스/멀티호스트 확장이나 작업 유실 방지가
+        필요하면 <strong>Celery + Redis/RabbitMQ</strong> 같은 외부 브로커 기반 큐를 씁니다.
+        Django 생태계에서는 Celery가 사실상 표준입니다. 본 샘플은 단일 프로세스 학습용입니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 서버 기동 (consumer 스레드는 앱 로드 시 자동 기동)
+uv run python manage.py runserver
+
+# 작업 투입 / 조회
+curl -X POST localhost:8000/tasks -H "content-type: application/json" -d '{"payload":"hello"}'
+curl localhost:8000/tasks/1
+curl localhost:8000/stats
+
+# 통합 테스트 (순수 HTTP, gRPC 불필요)
+uv run pytest</code></pre>
+  <p>통합 테스트는 작업 투입 후 consumer 스레드가 <code>done</code>으로 처리하는지,
+  여러 작업 투입 시 <code>/stats</code>의 처리 카운트가 증가하는지를 결정론적으로
+  검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
