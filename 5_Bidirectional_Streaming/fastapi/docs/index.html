@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5_Bidirectional_Streaming · FastAPI HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>5_Bidirectional_Streaming — FastAPI HTTP→gRPC 게이트웨이 <span class="tag">FastAPI</span></h1>
+  <p>WebSocket 을 gRPC 양방향 스트림으로 중계하는 실시간 게이트웨이 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>채팅, 실시간 알림, 협업 편집, 라이브 시세처럼 클라이언트와 서버가 <strong>동시에</strong>
+  메시지를 주고받아야 하는 기능은 gRPC <strong>양방향 스트리밍(bidirectional streaming)</strong>으로
+  자연스럽게 표현됩니다. 하지만 브라우저는 gRPC 스트림을 직접 말할 수 없으므로,
+  앞단에 <strong>WebSocket↔gRPC 게이트웨이</strong>를 두는 패턴이 흔합니다.</p>
+  <p>이 샘플의 FastAPI 게이트웨이는 <code>WebSocket /ws/chat</code> 으로 받은 메시지를
+  내부 <code>ChatService.Chat</code> 양방향 스트림으로 중계하고, 서버가 흘려보내는 응답을
+  다시 WebSocket 으로 돌려줍니다. 클라이언트는 표준 WebSocket 만 알면 됩니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>WebSocket(text)</small></div>
+    <span class="arrow">⇄</span>
+    <div class="node">FastAPI 게이트웨이<br><small>/ws/chat</small></div>
+    <span class="arrow">⇄</span>
+    <div class="node">gRPC 양방향 스트림<br><small>요청큐 ⇆ 응답큐</small></div>
+    <span class="arrow">⇄</span>
+    <div class="node">gRPC 서버<br><small>ChatService.Chat</small></div>
+  </div>
+  <p>화살표가 양방향(⇄)인 점이 핵심입니다. 요청을 다 보내기 전에도 응답이 흘러올 수
+  있습니다. 게이트웨이는 비동기 WebSocket 과 동기 gRPC 스트림을 <strong>큐 + 스레드</strong>로
+  잇습니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>ws://.../ws/chat</code> 에 접속 → 게이트웨이가 accept</li>
+    <li>게이트웨이가 gRPC 양방향 호출을 <strong>백그라운드 스레드</strong>에서 시작
+        (요청 이터레이터 = 큐 구동 제너레이터)</li>
+    <li>reader 코루틴: WebSocket 텍스트 수신 → <code>send_q</code> 에 push</li>
+    <li>제너레이터가 <code>send_q</code> 에서 꺼내 <code>ChatMessage</code> 로 yield → 서버로 전송</li>
+    <li>서버가 응답을 흘리면 스레드가 <code>recv_q</code> 에 넣고, writer 코루틴이
+        <code>run_in_executor</code> 로 꺼내 WebSocket 으로 send</li>
+    <li>클라이언트가 끊으면 <code>None</code> 센티넬로 요청 스트림을 half-close 하고 정리</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>요청 제너레이터를 큐로 구동 (main.py)</h3>
+  <pre><code>send_q = queue.Queue()
+
+def request_gen():
+    while True:
+        item = send_q.get()        # WebSocket 에서 도착한 텍스트
+        if item is None:           # 센티넬 → half-close
+            return
+        yield messages_pb2.ChatMessage(message=item)
+
+# 블로킹 양방향 호출은 별도 스레드에서
+for response in client.chat(request_gen()):
+    recv_q.put(("msg", response.message))</code></pre>
+  <h3>async ⇄ sync 브리징</h3>
+  <pre><code>async def reader():   # WebSocket -> 요청큐
+    text = await websocket.receive_text(); send_q.put(text)
+
+async def writer():   # 응답큐 -> WebSocket
+    item = await loop.run_in_executor(None, recv_q.get)
+    await websocket.send_text(item[1])
+
+await asyncio.gather(reader(), writer())   # 동시 구동 = 진짜 양방향</code></pre>
+  <h3>gRPC → HTTP/WebSocket 매핑</h3>
+  <table>
+    <tr><th>상황</th><th>처리</th></tr>
+    <tr><td>정상 응답</td><td>WebSocket text 프레임으로 그대로 전달</td></tr>
+    <tr><td>gRPC RpcError</td><td><code>error: {details}</code> 텍스트로 통지 후 종료</td></tr>
+    <tr><td>클라이언트 disconnect</td><td>요청 스트림 half-close, 스레드 join</td></tr>
+    <tr><td>GET /health</td><td>200 <code>{"status":"ok"}</code></td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>백프레셔(Backpressure)</strong>가 핵심입니다. WebSocket 입력이
+  gRPC 처리보다 빠르면 <code>send_q</code> 가 무한정 커집니다. 큐에 상한(maxsize)을 두고,
+  가득 차면 수신을 일시 멈추거나 연결을 종료하는 정책이 필요합니다.</div>
+  <ul>
+    <li><strong>스레드 누수 방지</strong>: 양방향 호출은 블로킹 스레드를 점유합니다. 연결
+        종료 시 반드시 센티넬로 요청 스트림을 닫고 <code>join</code> 해야 워커가 샙니다.</li>
+    <li><strong>연결 수명/타임아웃</strong>: 유휴 연결을 무한정 열어두지 말고 keepalive/타임아웃을
+        둡니다. 다수의 동시 WebSocket 은 그만큼의 gRPC 스트림·스레드를 의미합니다.</li>
+    <li><strong>순서 보장</strong>: 양방향 스트림 내에서 메시지 순서는 보장되지만, 여러
+        연결 간 순서는 보장되지 않습니다. 애플리케이션 레벨 시퀀스가 필요할 수 있습니다.</li>
+    <li><strong>진짜 비동기 대안</strong>: 동기 스텁 + 스레드 대신 <code>grpc.aio</code>
+        (asyncio 네이티브 gRPC)를 쓰면 스레드 브리징 없이 더 깔끔합니다. 본 샘플은 동기
+        스텁으로 큐 구동 패턴을 명확히 보이는 데 초점을 뒀습니다.</li>
+    <li><strong>인증/인가</strong>: WebSocket 핸드셰이크 시 토큰을 검증하고, 게이트웨이가
+        gRPC 메타데이터로 신원을 전달하는 설계를 권장합니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 서버 (양방향 ChatService, 포트 50055)
+# 게이트웨이 기동
+uv run uvicorn app.main:app --reload
+
+# 통합 테스트 (echo 양방향 서버를 직접 띄워 WebSocket 중계 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 echo 서버(받은 메시지를 <code>echo: {message}</code> 로 반환)를 띄우고,
+  WebSocket 으로 3개를 보내면 정확히 3개의 에코를 받는지 결정론적으로 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
