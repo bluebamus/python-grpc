@@ -1,0 +1,30 @@
+syntax = "proto3";                                  // 사용할 protobuf 문법 버전 선언 (proto3)
+
+service Greeter{                                     // Greeter 라는 이름의 gRPC 서비스 정의
+    rpc SayHello(HelloRequest) returns (HelloReply) {}  // SayHello RPC: HelloRequest를 받아 HelloReply를 반환 (Unary)
+}
+
+message HelloRequest{                               // 요청 메시지 타입 정의
+    string name = 1;                                // name 필드 (문자열), 태그 번호 1
+}
+
+message HelloReply{                                 // 응답 메시지 타입 정의
+    string message=1;                               // message 필드 (문자열), 태그 번호 1
+}
+
+// python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. helloworld.proto
+//
+// [생성되는 파일]
+//   1) helloworld_pb2.py       : 메시지 클래스(HelloRequest, HelloReply)의 직렬화/역직렬화 코드
+//   2) helloworld_pb2_grpc.py  : 서비스 stub/servicer 코드 (GreeterStub, GreeterServicer 등)
+//
+// [옵션 의미]
+//   -m grpc_tools.protoc : grpcio-tools 패키지에 포함된 protoc 컴파일러 모듈 실행
+//   -I.                  : proto 파일을 찾을 import 경로(--proto_path 단축형), 여기서는 현재 폴더
+//   --python_out=.       : 메시지 코드(_pb2.py) 출력 위치 → 현재 폴더
+//   --grpc_python_out=.  : gRPC 서비스 코드(_pb2_grpc.py) 출력 위치 → 현재 폴더
+//   helloworld.proto     : 컴파일할 입력 proto 파일
+//
+// [네이밍 규칙]
+//   - 출력 파일명은 "<proto파일명>_pb2.py", "<proto파일명>_pb2_grpc.py" 형태로 자동 생성됨
+//   - client/server 코드에서는 이 두 모듈을 import 하여 사용 (예: import helloworld_pb2, helloworld_pb2_grpc)

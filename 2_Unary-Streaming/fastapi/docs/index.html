@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2_Unary-Streaming · FastAPI HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>2_Unary-Streaming — FastAPI HTTP→gRPC 게이트웨이 <span class="tag">FastAPI</span></h1>
+  <p>가장 기본적인 Unary RPC(SayHello)를 REST 로 감싸는 게이트웨이 실무 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>내부 마이크로서비스는 흔히 gRPC 로 통신하지만, 브라우저·모바일·외부 파트너는
+  여전히 REST(JSON)를 기대합니다. <strong>HTTP→gRPC 게이트웨이</strong>는 앞단에서
+  REST 를 노출하고, 요청을 내부 gRPC 호출로 변환합니다. 이 예제는 그 중 가장
+  단순한 형태인 <strong>Unary RPC</strong>(요청 1 : 응답 1)를 감싸는 패턴을 보여줍니다.</p>
+  <p>핵심은 <strong>경계 분리</strong>입니다. 외부 계약(REST/Pydantic 스키마)과 내부
+  계약(proto 메시지)을 분리해, 한쪽 변경이 다른 쪽으로 곧바로 새지 않게 합니다.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">FastAPI 게이트웨이<br><small>POST /hello</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 채널<br><small>GreeterStub</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>Greeter.SayHello</small></div>
+  </div>
+  <p>응답은 역방향으로 흐릅니다. 백엔드가 에러를 던지면 게이트웨이가 gRPC 상태코드를
+  HTTP 코드로 변환해 클라이언트에 응답합니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /hello {"name":"World"}</code> 호출</li>
+    <li>FastAPI 가 Pydantic 으로 입력 검증 (빈 문자열 → <code>422</code>)</li>
+    <li>게이트웨이가 재사용 중인 gRPC 스텁으로 <code>SayHello(HelloRequest(name))</code> 호출</li>
+    <li>백엔드가 <code>HelloReply(message)</code> 반환</li>
+    <li>게이트웨이가 <code>{"message": ..., "elapsed_ms": ...}</code> 로 응답</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>채널/스텁 재사용 (grpc_client.py)</h3>
+  <pre><code>channel = grpc.insecure_channel(target)        # 앱 수명 동안 1회 생성
+stub = helloworld_pb2_grpc.GreeterStub(channel)
+
+def say_hello(name: str) -> str:
+    req = helloworld_pb2.HelloRequest(name=name)
+    return stub.SayHello(req, timeout=5.0).message</code></pre>
+  <h3>입력 검증 (schemas.py)</h3>
+  <pre><code>class HelloRequest(BaseModel):
+    name: str = Field(..., min_length=1)   # 빈 name 은 422 로 거부</code></pre>
+  <h3>gRPC → HTTP 상태코드 매핑 (main.py)</h3>
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>UNAUTHENTICATED</td><td>401</td><td>인증 필요</td></tr>
+    <tr><td>PERMISSION_DENIED</td><td>403</td><td>권한 없음</td></tr>
+    <tr><td>NOT_FOUND</td><td>404</td><td>리소스 없음</td></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>백엔드 일시 불가</td></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>타임아웃</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>이중 검증</strong>: 게이트웨이는 Pydantic 으로 1차 검증하지만,
+  백엔드 역시 자체 검증을 합니다. 게이트웨이를 우회하는 다른 클라이언트가 있을 수
+  있으므로 <strong>백엔드 검증은 신뢰의 최종 경계</strong>입니다. 본 샘플은 백엔드의
+  <code>INVALID_ARGUMENT</code> 도 <code>400</code> 으로 매핑해 일관된 의미를 유지합니다.</div>
+  <ul>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. 요청마다 만들지 말고 앱 수명 동안
+        재사용하세요(본 샘플은 lifespan 에서 1회 생성).</li>
+    <li><strong>타임아웃</strong>: 모든 gRPC 호출에 데드라인을 두세요. 백엔드가 응답하지 않을 때
+        게이트웨이 워커가 무한정 묶이는 것을 막습니다(본 샘플 <code>timeout=5.0</code>).</li>
+    <li><strong>스키마 분리</strong>: proto 메시지를 그대로 노출하지 말고 REST 스키마를 따로
+        두세요. 내부 proto 변경이 외부 API 계약으로 새지 않습니다.</li>
+    <li><strong>에러 매핑 일관성</strong>: gRPC 상태코드↔HTTP 코드 매핑 표를 한 곳에 모아
+        모든 엔드포인트가 같은 규칙을 쓰게 하세요.</li>
+    <li><strong>관측성</strong>: 응답 지연을 메트릭/로그로 남기세요. 본 샘플은
+        <code>elapsed_ms</code> 를 응답에 포함합니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50052)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run uvicorn app.main:app --reload
+
+# 통합 테스트 (결정론적 Greeter 서버를 직접 띄워 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 <code>/health</code> 200, 정상 <code>SayHello</code> 성공
+  (<code>Hello, World!</code>), 빈 <code>name</code> → 422, 백엔드 INVALID_ARGUMENT → 400
+  을 결정론적으로 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
