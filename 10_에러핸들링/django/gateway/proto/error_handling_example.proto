@@ -1,0 +1,18 @@
+syntax="proto3";
+
+package error_handling_example;
+
+service Calculator{
+    rpc Divide(DivideRequest)returns(DivideResponse);
+}
+
+message DivideRequest{
+    double dividend=1;
+    double divisor=2;
+}
+
+message DivideResponse{
+    double quotient=1;
+}
+
+//python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. error_handling_example.proto
