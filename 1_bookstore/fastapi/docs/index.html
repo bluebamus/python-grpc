@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1_bookstore · FastAPI protobuf 직렬화</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#0ea5e9,#1e40af); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#e0f2fe; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#7dd3fc; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#0ea5e9; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>1_bookstore — FastAPI protobuf 직렬화 <span class="tag">FastAPI</span></h1>
+  <p>gRPC 서비스 없이 protobuf 메시지를 웹 서비스의 데이터 포맷으로 쓰는 실무 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 왜 protobuf 직렬화인가</h2>
+  <p>이 예제의 <code>book.proto</code> 에는 <strong>gRPC 서비스(service/rpc)가 없습니다.</strong>
+  <code>Book</code>, <code>Customer</code>, <code>Order(Customer customer, repeated Book items)</code>
+  메시지만 정의되어 있습니다. 즉 주제는 gRPC 통신이 아니라 <strong>Protocol Buffers 를
+  데이터 직렬화 포맷 그 자체</strong>로 쓰는 것입니다.</p>
+  <p>protobuf 직렬화는 객체를 작고 빠른 바이너리로 바꿔, 네트워크 전송·캐시·메시지 큐·
+  파일 저장에 싣습니다. JSON 과 비교하면:</p>
+  <table>
+    <tr><th>관점</th><th>JSON</th><th>protobuf</th></tr>
+    <tr><td>크기</td><td>필드명까지 텍스트로 반복 → 큼</td><td>필드 <em>번호</em>+바이너리 → 작음</td></tr>
+    <tr><td>속도</td><td>문자열 파싱</td><td>바이너리 파싱 → 빠름</td></tr>
+    <tr><td>스키마</td><td>없음(자유 형식)</td><td><code>.proto</code> 로 강제 → 계약이 명확</td></tr>
+    <tr><td>가독성</td><td>사람이 읽기 쉬움</td><td>바이너리(사람이 못 읽음)</td></tr>
+    <tr><td>하위호환</td><td>관례에 의존</td><td>필드 번호 규칙으로 안전</td></tr>
+  </table>
+  <p>실무에서는 서비스 간 메시지 포맷, Kafka 이벤트 페이로드, Redis 캐시 값, 로그/이벤트
+  적재 포맷 등에서 "스키마가 있고 작고 빠른" protobuf 를 데이터 포맷으로 채택합니다.</p>
+</section>
+
+<section>
+  <h2>2. 구조</h2>
+  <div class="flow">
+    <div class="node">클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">FastAPI<br><small>Pydantic 검증</small></div>
+    <span class="arrow">→</span>
+    <div class="node">serializer.py<br><small>JSON → Book(proto)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">SerializeToString<br><small>bytes</small></div>
+  </div>
+  <pre><code>fastapi/
+├── app/
+│   ├── proto/         # 컴파일된 book_pb2.py (서비스 없음 → _grpc 는 비어 있음)
+│   ├── serializer.py  # proto 변환 + Serialize/Parse 핵심
+│   ├── schemas.py     # Pydantic 입력 검증
+│   ├── config.py      # 설정
+│   └── main.py        # 엔드포인트 (/books, /orders, /books/decode, /health)
+├── tests/             # 순수 HTTP 통합 테스트
+└── docs/index.html</code></pre>
+  <p>gRPC 서버도, 포트도 없습니다. 직렬화는 in-process 함수 호출입니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /books {"isbn":..., "title":...}</code> 호출</li>
+    <li>FastAPI 가 Pydantic 으로 입력 검증 (필수 필드 누락 → <code>422</code>)</li>
+    <li><code>serializer.build_book()</code> 가 JSON → <code>book_pb2.Book</code> 변환</li>
+    <li><code>SerializeToString()</code> 으로 바이너리 bytes 생성 → 길이·base64 측정</li>
+    <li><code>ParseFromString()</code> 으로 되돌려 원본과 <code>==</code> 비교 (왕복 일치 증명)</li>
+    <li>응답: <code>{"book":{...}, "serialized_size":N, "serialized_base64":"...", "roundtrip_ok":true}</code></li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>직렬화 / 역직렬화 왕복 (serializer.py)</h3>
+  <pre><code>book = book_pb2.Book(isbn=..., title=..., price=39.99, page_count=480)
+
+# 직렬화: 메시지 → 바이너리 bytes
+data = book.SerializeToString()
+
+# 역직렬화: bytes → 메시지
+restored = book_pb2.Book()
+restored.ParseFromString(data)
+
+# protobuf 메시지는 == 로 필드 단위 비교 → 왕복 무손실 증명
+assert restored == book</code></pre>
+  <h3>중첩 + repeated (Order)</h3>
+  <pre><code>order = book_pb2.Order(
+    order_number="ORD-1",
+    customer=book_pb2.Customer(id="c1", name="홍길동"),   # 중첩 메시지
+    items=[book_a, book_b],                               # repeated Book
+)
+data = order.SerializeToString()   # 중첩/리스트가 하나의 바이너리로</code></pre>
+  <p>repeated 필드는 항목이 늘수록 직렬화 크기가 커집니다. 테스트는 items 가 2개일 때
+  1개보다 <code>serialized_size</code> 가 크다는 것으로 이를 검증합니다.</p>
+  <h3>bytes 전송 (base64)</h3>
+  <pre><code># 바이너리를 JSON/HTTP 본문에 안전하게 싣기 위해 base64 로 인코딩
+serialized_base64 = base64.b64encode(data).decode("ascii")
+# 받는 쪽: base64 → bytes → ParseFromString</code></pre>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>필드 번호는 영원하다.</strong> protobuf 는 필드명이 아니라
+  <code>= 1, = 2</code> 같은 <strong>필드 번호</strong>로 바이너리를 읽습니다. 한 번 배포된
+  필드 번호는 재사용·변경하면 안 됩니다. 번호를 바꾸면 옛 데이터가 엉뚱한 필드로 해석됩니다.</div>
+  <ul>
+    <li><strong>스키마 진화 / 하위호환</strong>: 새 필드는 <em>새 번호</em>로만 추가합니다.
+        구버전 리더는 모르는 필드를 무시하고(forward-compat), 신버전 리더는 빠진 필드를
+        기본값으로 읽습니다(backward-compat). 필드 삭제 시 번호를 <code>reserved</code> 로
+        막아 재사용을 방지합니다.</li>
+    <li><strong>필수/기본값</strong>: proto3 에는 <code>required</code> 가 없습니다. 빠진 필드는
+        기본값(빈 문자열/0)으로 채워지므로, "값이 없음"과 "기본값"을 구분해야 하면 애플리케이션
+        검증(이 샘플은 Pydantic) 또는 <code>optional</code> 키워드를 씁니다.</li>
+    <li><strong>bytes 전송</strong>: 직렬화 결과는 바이너리라 JSON/텍스트 채널에 그대로 못 싣습니다.
+        HTTP 본문에 실으려면 base64(약 33% 증가) 또는 <code>application/octet-stream</code> 으로
+        raw bytes 전송을 고려합니다.</li>
+    <li><strong>JSON 대비 크기</strong>: protobuf 는 필드명을 반복하지 않아 같은 데이터를 훨씬 작게
+        담습니다. 트래픽/저장 비용이 큰 경로(이벤트 스트림, 캐시)에서 이점이 큽니다.</li>
+    <li><strong>float 정밀도</strong>: <code>float</code>(32bit)는 미세 오차가 있습니다. 금액 등 정확도가
+        중요하면 정수(센트 단위)나 문자열/decimal 표현을 고려하세요. 본 샘플은 표시용으로 반올림합니다.</li>
+    <li><strong>스키마 공유</strong>: 송수신 양쪽이 같은 <code>.proto</code> 를 공유해야 합니다. proto 를
+        버전 관리·배포(예: buf, 사내 레지스트리)하는 체계를 갖추는 것이 실무 핵심입니다.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># proto 컴파일 (이미 생성되어 있다면 생략)
+cd ../..  # python-grpc 루트
+uv run python -m grpc_tools.protoc -I=1_bookstore/fastapi/app/proto \
+  --python_out=1_bookstore/fastapi/app/proto \
+  --grpc_python_out=1_bookstore/fastapi/app/proto book.proto
+
+# 의존성 설치 & 앱 기동
+cd 1_bookstore/fastapi
+uv sync
+uv run uvicorn app.main:app --reload
+
+# 호출 예
+curl -X POST localhost:8000/books -H "content-type: application/json" \
+  -d '{"isbn":"978-0134685991","title":"Effective Python","price":39.99}'
+
+# 통합 테스트 (gRPC 서버 불필요, 순수 HTTP)
+uv run pytest</code></pre>
+  <p>테스트는 (1) <code>/health</code> 200, (2) <code>/books</code> 왕복 일치(<code>roundtrip_ok</code>)와
+  크기 &gt; 0, (3) <code>/orders</code> 의 repeated items 반영(크기 증가), (4) <code>/books/decode</code>
+  가 <code>/books</code> 의 base64 로 원본 복원, (5) 필수 필드 누락 시 422 를 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>
