@@ -14,4 +14,4 @@ message Response{
     string response_data=1;
 }
 
-//python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. cancal_example.proto
+//python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. cancel_example.proto

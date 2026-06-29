@@ -12,7 +12,7 @@ class CalculatorServicer(error_handling_example_pb2_grpc.CalculatorServicer):
             context.set_details("Division by zero is not allowed.")
             return error_handling_example_pb2.DivideResponse()
         quotient = request.dividend / request.divisor
-        return error_handling_example_pb2.DivideResponse(result=quotient)
+        return error_handling_example_pb2.DivideResponse(quotient=quotient)
     
 
 def serve():
