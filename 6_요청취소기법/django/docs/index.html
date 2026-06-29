@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6_요청취소기법 · Django HTTP→gRPC 게이트웨이</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#4ade80; --text:#e2e8f0; --muted:#94a3b8; --code:#0b1220; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif; background:var(--bg); color:var(--text); line-height:1.7; }
+  header { padding:2.5rem 1.5rem; background:linear-gradient(135deg,#16a34a,#065f46); }
+  header h1 { margin:0; font-size:1.9rem; }
+  header p { margin:.5rem 0 0; color:#dcfce7; }
+  main { max-width:920px; margin:0 auto; padding:1.5rem; }
+  section { background:var(--card); border-radius:12px; padding:1.5rem 1.75rem; margin:1.5rem 0; box-shadow:0 4px 16px rgba(0,0,0,.25); }
+  h2 { color:var(--accent); border-bottom:1px solid #334155; padding-bottom:.5rem; margin-top:0; }
+  h3 { color:#86efac; margin-bottom:.3rem; }
+  code { background:var(--code); padding:.15rem .4rem; border-radius:5px; font-family:"Fira Code",Consolas,monospace; font-size:.9em; color:#fbbf24; }
+  pre { background:var(--code); padding:1rem; border-radius:8px; overflow-x:auto; border:1px solid #334155; }
+  pre code { background:none; color:#cbd5e1; padding:0; }
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; justify-content:center; margin:1rem 0; }
+  .node { background:#0b1220; border:1px solid var(--accent); border-radius:8px; padding:.6rem .9rem; text-align:center; font-size:.85rem; }
+  .arrow { color:var(--accent); font-weight:bold; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; }
+  th,td { border:1px solid #334155; padding:.55rem .7rem; text-align:left; font-size:.92rem; }
+  th { background:#0b1220; color:var(--accent); }
+  .warn { border-left:4px solid var(--warn); background:#27210b; padding:.8rem 1rem; border-radius:6px; }
+  .tag { display:inline-block; background:#16a34a; color:#001; font-size:.7rem; font-weight:700; padding:.1rem .5rem; border-radius:99px; margin-left:.5rem; vertical-align:middle; }
+  ul { margin:.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>6_요청취소기법 — Django HTTP→gRPC 게이트웨이 <span class="tag">Django</span></h1>
+  <p>per-call 데드라인으로 오래 걸리는 작업을 취소하고 백엔드 자원 낭비를 막는 가이드</p>
+</header>
+<main>
+
+<section>
+  <h2>1. 개요 — 실무에서 어디에 쓰나</h2>
+  <p>리포트 생성, 대용량 변환처럼 <strong>오래 걸리는 작업</strong>은 사용자가 끝까지
+  기다리지 않을 수 있고, 무한정 백엔드 자원을 붙들면 안 됩니다. 게이트웨이가 호출마다
+  <strong>per-call 데드라인(timeout)</strong> 을 걸면, 시간 초과 시 gRPC 가
+  <code>DEADLINE_EXCEEDED</code> 를 던지고 서버 측 작업도 취소됩니다.</p>
+  <p>Django 의 기본 WSGI 는 동기 처리라 브라우저 연결 끊김을 즉시 감지하기 어렵습니다.
+  그래서 이 샘플은 <strong>데드라인으로 자원 사용 상한</strong>을 두는 데 집중합니다.
+  브라우저 이탈 감지가 꼭 필요하다면 FastAPI 샘플의 <code>request.is_disconnected()</code>
+  방식을 참고하세요.</p>
+</section>
+
+<section>
+  <h2>2. 아키텍처 / 흐름도</h2>
+  <div class="flow">
+    <div class="node">브라우저 / 클라이언트<br><small>REST(JSON)</small></div>
+    <span class="arrow">→</span>
+    <div class="node">Django 게이트웨이<br><small>POST /operation</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 채널<br><small>timeout=deadline</small></div>
+    <span class="arrow">→</span>
+    <div class="node">gRPC 서버<br><small>LongRunningOperation</small></div>
+  </div>
+  <p>데드라인을 넘기면 gRPC 가 <code>DEADLINE_EXCEEDED</code> 를 던지고, 서버 측
+  <code>context.is_active()</code> 가 <code>False</code> 가 되어 작업이 중단됩니다.
+  게이트웨이는 이를 <code>504</code> 로 변환해 응답합니다.</p>
+</section>
+
+<section>
+  <h2>3. 호출 흐름 (단계별)</h2>
+  <ol>
+    <li>클라이언트가 <code>POST /operation {"data":"...", "deadline_ms":500}</code> 호출</li>
+    <li>뷰가 JSON 파싱 + 검증 (빈 문자열 → <code>422</code>)</li>
+    <li>게이트웨이가 <code>stub.LongRunningOperation(req, timeout=deadline)</code> 로 호출</li>
+    <li>데드라인 초과 시 <code>DEADLINE_EXCEEDED</code> → <code>504</code> 매핑.
+        정상 완료 시 결과 반환</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4. 코드 핵심 포인트</h2>
+  <h3>per-call 데드라인 적용 (grpc_client.py)</h3>
+  <pre><code>request = cancel_example_pb2.Request(request_data=data)
+# timeout(초) 초과 시 grpc.RpcError(DEADLINE_EXCEEDED) 발생
+response = stub.LongRunningOperation(request, timeout=timeout_s)</code></pre>
+
+  <h3>gRPC → HTTP 매핑 (views.py)</h3>
+  <pre><code>try:
+    result = get_client().long_running_operation(data, timeout=timeout_s)
+except grpc.RpcError as exc:
+    status = _GRPC_TO_HTTP.get(exc.code(), 500)  # DEADLINE_EXCEEDED -> 504
+    return JsonResponse({"detail": exc.details()}, status=status)</code></pre>
+
+  <h3>취소 가능한 서버 (server 측)</h3>
+  <pre><code>def LongRunningOperation(self, request, context):
+    for _ in range(STEP_COUNT):
+        if not context.is_active():   # 클라이언트가 포기/취소했다
+            return Response(response_data="cancelled")
+        time.sleep(STEP_SECONDS)      # 오래 걸리는 작업의 한 단위
+    return Response(response_data=f"completed: {request.request_data}")</code></pre>
+
+  <table>
+    <tr><th>gRPC StatusCode</th><th>HTTP</th><th>의미</th></tr>
+    <tr><td>DEADLINE_EXCEEDED</td><td>504</td><td>데드라인 초과 → 작업 취소</td></tr>
+    <tr><td>CANCELLED</td><td>499</td><td>취소됨</td></tr>
+    <tr><td>UNAVAILABLE</td><td>503</td><td>백엔드 일시 불가</td></tr>
+    <tr><td>INVALID_ARGUMENT</td><td>400</td><td>잘못된 입력</td></tr>
+    <tr><td>(기타)</td><td>500</td><td>알 수 없는 오류</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>5. 실무 적용 시 고려사항</h2>
+  <div class="warn"><strong>취소는 협력적(cooperative)</strong>입니다. 서버가
+  <code>context.is_active()</code> 를 주기적으로 확인하지 않으면, 데드라인이 지나도
+  백엔드는 작업을 끝까지 수행합니다. 오래 걸리는 루프 안에 취소 확인 지점을 두세요.</div>
+  <ul>
+    <li><strong>데드라인 전파</strong>: 게이트웨이가 받은 데드라인을 하위 호출에도 전달해야
+        전체 호출 체인이 함께 끊깁니다.</li>
+    <li><strong>동기 WSGI 의 한계</strong>: 기본 Django(WSGI)는 브라우저 이탈을 즉시 감지하기
+        어렵습니다. ASGI + async 뷰로 가면 FastAPI 처럼 연결 끊김 감지를 구현할 수 있습니다.</li>
+    <li><strong>멱등성</strong>: 취소된 작업이 일부 부수효과를 남겼을 수 있습니다. 정리(rollback)
+        나 멱등 설계를 고려하세요.</li>
+    <li><strong>데드라인 값 선택</strong>: 너무 짧으면 정상 작업도 504 가 되고, 너무 길면 취소
+        효과가 약해집니다. SLO 기반으로 정하세요.</li>
+    <li><strong>채널 재사용</strong>: 채널 생성은 비쌉니다. 요청마다 만들지 말고 프로세스 단위로
+        재사용하세요(본 샘플은 get_client 로 1회 생성).</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6. 실행 · 테스트</h2>
+  <pre><code># 의존성 설치
+uv sync
+
+# 백엔드 gRPC 서버 (상위 폴더 예제, 포트 50056)
+cd .. &amp;&amp; uv run python server.py
+
+# 게이트웨이 기동
+uv run python manage.py runserver
+
+# 통합 테스트 (gRPC 서버를 직접 띄워 데드라인/취소 검증)
+uv run pytest</code></pre>
+  <p>통합 테스트는 충분한 데드라인이면 정상 완료(200)되고, 짧은 데드라인이면
+  <code>DEADLINE_EXCEEDED</code> 가 <code>504</code> 로 매핑되며, 그때 서버 작업이
+  <code>cancelled</code> 로 일찍 종료되는지를 결정론적으로 검증합니다.</p>
+</section>
+
+</main>
+</body>
+</html>

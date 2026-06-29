@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package cancel_example;
+
+service CancelService {
+    // 오래 걸리는 단항(unary) 작업. 클라이언트가 데드라인을 넘기거나 연결을
+    // 끊으면 서버 측 context 가 비활성화되고, 서버는 작업을 중단할 수 있다.
+    rpc LongRunningOperation(Request) returns (Response);
+}
+
+message Request {
+    string request_data = 1;
+}
+
+message Response {
+    string response_data = 1;
+}
